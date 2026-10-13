@@ -651,6 +651,9 @@ func (c *concurrentFilesClient) List(_ context.Context, _ string) ([]filesapi.Ba
 	return nil, nil
 }
 func (c *concurrentFilesClient) Delete(_ context.Context, _, _ string) error { return nil }
+func (c *concurrentFilesClient) OpenStream(_ context.Context, _, _ string) (filesapi.StreamWriter, error) {
+	return nil, errors.New("not implemented")
+}
 func (c *concurrentFilesClient) GetContext(p context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithCancel(p)
 }

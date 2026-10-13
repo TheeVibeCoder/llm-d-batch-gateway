@@ -121,6 +121,9 @@ func (f *failNTimesFilesClient) List(_ context.Context, _ string) ([]filesapi.Ba
 	return nil, nil
 }
 func (f *failNTimesFilesClient) Delete(_ context.Context, _, _ string) error { return nil }
+func (f *failNTimesFilesClient) OpenStream(_ context.Context, _, _ string) (filesapi.StreamWriter, error) {
+	return nil, errors.New("not implemented")
+}
 func (f *failNTimesFilesClient) GetContext(p context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithCancel(p)
 }
@@ -148,6 +151,9 @@ func (f *failOnNthCallClient) List(_ context.Context, _ string) ([]filesapi.Batc
 	return nil, nil
 }
 func (f *failOnNthCallClient) Delete(_ context.Context, _, _ string) error { return nil }
+func (f *failOnNthCallClient) OpenStream(_ context.Context, _, _ string) (filesapi.StreamWriter, error) {
+	return nil, errors.New("not implemented")
+}
 func (f *failOnNthCallClient) GetContext(p context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithCancel(p)
 }

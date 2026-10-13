@@ -75,19 +75,35 @@ func (m *mockS3Client) CreateBucket(_ context.Context, params *s3.CreateBucketIn
 	return &s3.CreateBucketOutput{}, nil
 }
 
-func (m *mockUploader) Upload(_ context.Context, params *s3.PutObjectInput, _ ...func(*manager.Uploader)) (*manager.UploadOutput, error) { //nolint:staticcheck // TODO: migrate to feature/s3/transfermanager
+func (m *mockUploader) Upload(ctx context.Context, params *s3.PutObjectInput, _ ...func(*manager.Uploader)) (*manager.UploadOutput, error) { //nolint:staticcheck // TODO: migrate to feature/s3/transfermanager
 	if m.uploadErr != nil {
 		return nil, m.uploadErr
 	}
-	data, err := io.ReadAll(params.Body)
-	if err != nil {
-		return nil, err
+	// Read the body concurrently so a cancelled context interrupts the
+	// upload, matching the real uploader's behavior.
+	type readResult struct {
+		data []byte
+		err  error
 	}
-	m.s3Client.objects[*params.Key] = mockObject{
-		data:        data,
-		lastModTime: time.Now(),
+	read := make(chan readResult, 1)
+	go func() {
+		data, err := io.ReadAll(params.Body)
+		read <- readResult{data: data, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-read:
+		if r.err != nil {
+			return nil, r.err
+		}
+		m.s3Client.objects[*params.Key] = mockObject{
+			data:        r.data,
+			lastModTime: time.Now(),
+		}
+		return &manager.UploadOutput{}, nil
 	}
-	return &manager.UploadOutput{}, nil
 }
 
 func (m *mockS3Client) GetObject(_ context.Context, params *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
@@ -511,6 +527,133 @@ func TestValidate(t *testing.T) {
 		cfg := &Config{Region: "us-east-1"}
 		if err := cfg.Validate(); err == nil {
 			t.Error("expected error for missing bucket")
+		}
+	})
+}
+
+func TestOpenStream(t *testing.T) {
+	t.Run("commit uploads the streamed data", func(t *testing.T) {
+		ctx := context.Background()
+		mock := newMockS3Client()
+		client := newTestClient(mock)
+		content := []byte("line1\nline2\n")
+		key := testFolderName + "/out.jsonl"
+
+		w, err := client.OpenStream(ctx, "out.jsonl", testFolderName)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if _, err := w.Write(content); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+
+		md, err := w.Commit(ctx)
+		if err != nil {
+			t.Fatalf("commit failed: %v", err)
+		}
+		if md.Size != int64(len(content)) {
+			t.Errorf("expected size %d, got %d", len(content), md.Size)
+		}
+		if md.Location != key {
+			t.Errorf("expected location %s, got %s", key, md.Location)
+		}
+
+		obj, ok := mock.objects[key]
+		if !ok {
+			t.Fatal("expected object to be uploaded")
+		}
+		if !bytes.Equal(obj.data, content) {
+			t.Errorf("expected content %q, got %q", content, obj.data)
+		}
+	})
+
+	t.Run("abort leaves no object behind", func(t *testing.T) {
+		ctx := context.Background()
+		mock := newMockS3Client()
+		client := newTestClient(mock)
+
+		w, err := client.OpenStream(ctx, "out.jsonl", testFolderName)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if _, err := w.Write([]byte("discarded")); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+		if err := w.Abort(ctx); err != nil {
+			t.Fatalf("abort failed: %v", err)
+		}
+
+		if _, _, err := client.Retrieve(ctx, "out.jsonl", testFolderName); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("expected no object after abort, got %v", err)
+		}
+	})
+
+	t.Run("upload failure surfaces from commit", func(t *testing.T) {
+		ctx := context.Background()
+		mock := newMockS3Client()
+		client := &Client{
+			s3Client: mock,
+			uploader: &mockUploader{s3Client: mock, uploadErr: errors.New("upload failed")},
+			bucket:   testBucketName,
+		}
+
+		w, err := client.OpenStream(ctx, "out.jsonl", testFolderName)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		// The upload may already be dead, in which case the write fails
+		// with the upload error; either way Commit must surface it.
+		_, _ = w.Write([]byte("data"))
+
+		if _, err := w.Commit(ctx); err == nil {
+			t.Fatal("expected commit to fail")
+		}
+	})
+
+	t.Run("context cancellation fails writes", func(t *testing.T) {
+		mock := newMockS3Client()
+		client := newTestClient(mock)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		w, err := client.OpenStream(ctx, "out.jsonl", testFolderName)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		cancel()
+
+		// The upload goroutine observes the cancellation and closes the
+		// pipe, so a subsequent write fails instead of blocking forever.
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			_, err = w.Write([]byte("data"))
+			if err != nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("write did not fail after context cancellation")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err := w.Abort(context.Background()); err != nil {
+			t.Fatalf("abort failed: %v", err)
+		}
+	})
+
+	t.Run("returns ErrFileExists for stored object", func(t *testing.T) {
+		ctx := context.Background()
+		mock := newMockS3Client()
+		client := newTestClient(mock)
+
+		w, err := client.OpenStream(ctx, "out.jsonl", testFolderName)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if _, err := w.Commit(ctx); err != nil {
+			t.Fatalf("commit failed: %v", err)
+		}
+
+		if _, err := client.OpenStream(ctx, "out.jsonl", testFolderName); !errors.Is(err, api.ErrFileExists) {
+			t.Errorf("expected ErrFileExists, got %v", err)
 		}
 	})
 }

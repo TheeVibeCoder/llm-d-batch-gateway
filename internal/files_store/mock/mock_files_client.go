@@ -19,6 +19,7 @@ package mock
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -45,6 +46,12 @@ func NewMockBatchFilesClient(rootDir string) *MockBatchFilesClient {
 // Store stores a file in the files storage.
 func (m *MockBatchFilesClient) Store(ctx context.Context, fileName, folderName string, fileSizeLimit, lineNumLimit int64, reader io.Reader) (*api.BatchFileMetadata, error) {
 	rootDir := m.rootDir
+	location := filepath.Join(folderName, fileName)
+	filePath := filepath.Join(rootDir, location)
+
+	if _, err := os.Stat(filePath); err == nil {
+		return nil, fmt.Errorf("%w: %s", api.ErrFileExists, location)
+	}
 
 	fullDir := filepath.Join(rootDir, folderName)
 	if err := os.MkdirAll(fullDir, 0755); err != nil {
@@ -52,7 +59,6 @@ func (m *MockBatchFilesClient) Store(ctx context.Context, fileName, folderName s
 	}
 
 	// create and write file
-	filePath := filepath.Join(fullDir, fileName)
 	file, err := os.Create(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create file: %w", err)
@@ -106,14 +112,77 @@ func (m *MockBatchFilesClient) Store(ctx context.Context, fileName, folderName s
 	}
 
 	// Return relative location (relative to rootDir)
-	relativeLocation := filepath.Join(folderName, fileName)
-
 	return &api.BatchFileMetadata{
-		Location:    relativeLocation,
+		Location:    location,
 		Size:        totalBytes,
 		LinesNumber: lineCount,
 		ModTime:     fileInfo.ModTime(),
 	}, nil
+}
+
+// OpenStream opens a streaming write buffered in memory. The file is
+// written only on Commit.
+func (m *MockBatchFilesClient) OpenStream(ctx context.Context, fileName, folderName string) (api.StreamWriter, error) {
+	location := filepath.Join(folderName, fileName)
+	filePath := filepath.Join(m.rootDir, location)
+
+	if _, err := os.Stat(filePath); err == nil {
+		return nil, fmt.Errorf("%w: %s", api.ErrFileExists, location)
+	}
+
+	return &mockStreamWriter{
+		rootDir:    m.rootDir,
+		fileName:   fileName,
+		folderName: folderName,
+	}, nil
+}
+
+// mockStreamWriter buffers a streaming write in memory.
+type mockStreamWriter struct {
+	rootDir    string
+	fileName   string
+	folderName string
+	buf        bytes.Buffer
+}
+
+var _ api.StreamWriter = (*mockStreamWriter)(nil)
+
+func (w *mockStreamWriter) Write(p []byte) (int, error) {
+	return w.buf.Write(p)
+}
+
+func (w *mockStreamWriter) Commit(ctx context.Context) (*api.BatchFileMetadata, error) {
+	fullDir := filepath.Join(w.rootDir, w.folderName)
+	if err := os.MkdirAll(fullDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	filePath := filepath.Join(fullDir, w.fileName)
+	file, err := os.Create(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	if _, err := file.Write(w.buf.Bytes()); err != nil {
+		_ = os.Remove(filePath)
+		return nil, fmt.Errorf("failed to write file: %w", err)
+	}
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	return &api.BatchFileMetadata{
+		Location: filepath.Join(w.folderName, w.fileName),
+		Size:     fileInfo.Size(),
+		ModTime:  fileInfo.ModTime(),
+	}, nil
+}
+
+func (w *mockStreamWriter) Abort(ctx context.Context) error {
+	return nil
 }
 
 // Retrieve retrieves a file from the files storage.

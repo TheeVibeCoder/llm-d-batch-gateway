@@ -234,6 +234,96 @@ func (c *Client) Store(ctx context.Context, fileName, folderName string, fileSiz
 	return metadata, nil
 }
 
+// errStreamAborted is the body-read error that aborts an in-flight upload.
+var errStreamAborted = errors.New("stream aborted")
+
+// OpenStream opens a streaming write to S3. The upload runs under the
+// context passed here: cancelling it fails subsequent writes. The object
+// becomes visible only when the returned StreamWriter is committed.
+func (c *Client) OpenStream(ctx context.Context, fileName, folderName string) (api.StreamWriter, error) {
+	key := c.buildKey(folderName, fileName)
+
+	_, err := c.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err == nil {
+		return nil, fmt.Errorf("%w: %s", api.ErrFileExists, key)
+	}
+
+	var notFound *types.NotFound
+	if !errors.As(err, &notFound) {
+		return nil, err
+	}
+
+	pr, pw := io.Pipe()
+	w := &s3StreamWriter{
+		pw:     pw,
+		done:   make(chan error, 1),
+		bucket: c.bucket,
+		key:    key,
+	}
+	go func() {
+		_, uploadErr := c.uploader.Upload(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(c.bucket),
+			Key:    aws.String(key),
+			Body:   pr,
+		})
+		// Unblock a writer stuck in Write now that the upload stopped
+		// reading (e.g. the context was cancelled).
+		_ = pr.CloseWithError(uploadErr)
+		w.done <- uploadErr
+	}()
+
+	return w, nil
+}
+
+// s3StreamWriter pipes writes into an S3 upload. The manager.Uploader
+// switches to multipart for large bodies and aborts its parts when the
+// body read fails, so an Abort leaves no partial object behind.
+type s3StreamWriter struct {
+	pw     *io.PipeWriter
+	done   chan error
+	bucket string
+	key    string
+	bytes  int64
+}
+
+var _ api.StreamWriter = (*s3StreamWriter)(nil)
+
+func (w *s3StreamWriter) Write(p []byte) (int, error) {
+	n, err := w.pw.Write(p)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *s3StreamWriter) Commit(ctx context.Context) (*api.BatchFileMetadata, error) {
+	if err := w.pw.Close(); err != nil {
+		return nil, err
+	}
+	if err := <-w.done; err != nil {
+		return nil, err
+	}
+
+	logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("File streamed successfully",
+		"bucket", w.bucket, "key", w.key, "size", w.bytes)
+
+	return &api.BatchFileMetadata{
+		Location: w.key,
+		Size:     w.bytes,
+		ModTime:  time.Now(),
+	}, nil
+}
+
+func (w *s3StreamWriter) Abort(ctx context.Context) error {
+	// Failing the body read aborts the upload.
+	_ = w.pw.CloseWithError(errStreamAborted)
+	if err := <-w.done; err == nil {
+		return fmt.Errorf("stream aborted but object %s was already uploaded", w.key)
+	}
+	return nil
+}
+
 // Retrieve retrieves a file from S3.
 // The folderName parameter is used as a key prefix for tenant isolation.
 func (c *Client) Retrieve(ctx context.Context, fileName, folderName string) (io.ReadCloser, *api.BatchFileMetadata, error) {

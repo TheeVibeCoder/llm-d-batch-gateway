@@ -54,4 +54,24 @@ type BatchFilesClient interface {
 
 	// Delete deletes the file in the specified location.
 	Delete(ctx context.Context, fileName, folderName string) (err error)
+
+	// OpenStream opens a streaming write for the file. It returns
+	// ErrFileExists when the file is already stored. The file becomes
+	// visible to readers only when the returned StreamWriter is committed.
+	OpenStream(ctx context.Context, fileName, folderName string) (writer StreamWriter, err error)
+}
+
+// StreamWriter incrementally writes one file. Written data becomes visible
+// only after a successful Commit; Abort discards it. Callers must call
+// exactly one of Commit or Abort.
+type StreamWriter interface {
+	io.Writer
+
+	// Commit finalizes the write and makes the file durable and visible.
+	// The returned metadata describes the stored file; LinesNumber is not
+	// tracked by streaming writes.
+	Commit(ctx context.Context) (fileMd *BatchFileMetadata, err error)
+
+	// Abort discards the write and removes any partial data.
+	Abort(ctx context.Context) (err error)
 }

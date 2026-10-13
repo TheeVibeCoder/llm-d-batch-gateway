@@ -63,6 +63,10 @@ func (m *mockFilesClient) Delete(_ context.Context, _, _ string) error {
 	return nil
 }
 
+func (m *mockFilesClient) OpenStream(_ context.Context, _, _ string) (api.StreamWriter, error) {
+	return nil, errors.New("not implemented")
+}
+
 func (m *mockFilesClient) Close() error { return nil }
 
 func retryCfg() retry.Config {
@@ -379,5 +383,20 @@ func TestMetrics_DeleteRetries(t *testing.T) {
 	})
 	if success != 1 {
 		t.Fatalf("file_storage_operations_total{delete,success} = %v, want 1", success)
+	}
+}
+
+func TestOpenStream_PassesThrough(t *testing.T) {
+	mock := &mockFilesClient{}
+	c := New(mock, retryCfg(), "test")
+
+	// Streams cannot be replayed, so OpenStream must forward directly:
+	// the inner client's error surfaces without any retry attempts.
+	_, err := c.OpenStream(context.Background(), "out.jsonl", "folder")
+	if err == nil || err.Error() != "not implemented" {
+		t.Fatalf("expected the inner error, got %v", err)
+	}
+	if mock.storeCalls != 0 {
+		t.Errorf("store calls = %d, want 0", mock.storeCalls)
 	}
 }

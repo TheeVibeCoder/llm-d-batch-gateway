@@ -115,21 +115,10 @@ func (c *Client) Store(ctx context.Context, fileName, folderName string, fileSiz
 		return nil, err
 	}
 
-	// Create temp file name within the target directory.
-	var tmpFile *os.File
-	var tmpName string
-	for range 3 {
-		tmpName = filepath.Join(dir, fmt.Sprintf(".tmp-%d-%d", time.Now().UnixNano(), tmpCounter.Add(1)))
-		tmpFile, err = c.root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, err
-		}
-	}
-	if tmpFile == nil {
-		return nil, fmt.Errorf("failed to create unique temp file in %s after retries", dir)
+	// Create temp file within the target directory.
+	tmpFile, tmpName, err := c.createTempFile(dir)
+	if err != nil {
+		return nil, err
 	}
 	defer func() {
 		// Clean up on error.
@@ -180,6 +169,96 @@ func (c *Client) Store(ctx context.Context, fileName, folderName string, fileSiz
 		"path", relPath, "size", metadata.Size, "lines", metadata.LinesNumber)
 
 	return metadata, nil
+}
+
+// createTempFile creates a uniquely named temporary file inside dir.
+func (c *Client) createTempFile(dir string) (*os.File, string, error) {
+	for range 3 {
+		tmpName := filepath.Join(dir, fmt.Sprintf(".tmp-%d-%d", time.Now().UnixNano(), tmpCounter.Add(1)))
+		tmpFile, err := c.root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			return tmpFile, tmpName, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, "", err
+		}
+	}
+	return nil, "", fmt.Errorf("failed to create unique temp file in %s after retries", dir)
+}
+
+// OpenStream opens a streaming write: data is buffered in a temp file and
+// becomes visible only when the stream is committed (atomic rename).
+func (c *Client) OpenStream(ctx context.Context, fileName, folderName string) (api.StreamWriter, error) {
+	relPath, err := c.resolvePath(folderName, fileName)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := c.root.Stat(relPath); err == nil {
+		return nil, fmt.Errorf("%w: %s", api.ErrFileExists, relPath)
+	}
+
+	dir := filepath.Dir(relPath)
+	if err := c.root.MkdirAll(dir, defaultDirPerm); err != nil {
+		return nil, err
+	}
+
+	tmpFile, tmpName, err := c.createTempFile(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	return &fsStreamWriter{
+		root:    c.root,
+		file:    tmpFile,
+		tmpName: tmpName,
+		dstPath: relPath,
+	}, nil
+}
+
+// fsStreamWriter streams into a temp file, renaming it into place on Commit.
+type fsStreamWriter struct {
+	root    *os.Root
+	file    *os.File
+	tmpName string
+	dstPath string
+}
+
+var _ api.StreamWriter = (*fsStreamWriter)(nil)
+
+func (w *fsStreamWriter) Write(p []byte) (int, error) {
+	return w.file.Write(p)
+}
+
+func (w *fsStreamWriter) Commit(ctx context.Context) (*api.BatchFileMetadata, error) {
+	info, err := w.file.Stat()
+	if err == nil {
+		err = w.file.Close()
+	}
+	if err == nil {
+		err = w.root.Rename(w.tmpName, w.dstPath)
+	}
+	if err != nil {
+		_ = w.root.Remove(w.tmpName)
+		return nil, err
+	}
+
+	logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("File streamed successfully",
+		"path", w.dstPath, "size", info.Size())
+
+	return &api.BatchFileMetadata{
+		Location: w.dstPath,
+		Size:     info.Size(),
+		ModTime:  info.ModTime(),
+	}, nil
+}
+
+func (w *fsStreamWriter) Abort(ctx context.Context) error {
+	_ = w.file.Close()
+	if err := w.root.Remove(w.tmpName); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // Retrieve retrieves a file from the filesystem.

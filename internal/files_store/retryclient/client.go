@@ -115,6 +115,12 @@ func (c *Client) Retrieve(ctx context.Context, fileName, folderName string) (io.
 	return rc, meta, err
 }
 
+// OpenStream passes through without retrying: a stream cannot be rewound,
+// so a failed attempt cannot be replayed with the same data.
+func (c *Client) OpenStream(ctx context.Context, fileName, folderName string) (api.StreamWriter, error) {
+	return c.inner.OpenStream(ctx, fileName, folderName)
+}
+
 func (c *Client) Delete(ctx context.Context, fileName, folderName string) error {
 	attempts, err := retry.Do(ctx, &c.cfg, func(attempt int) error {
 		if attempt > 1 {
