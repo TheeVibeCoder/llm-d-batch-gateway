@@ -55,6 +55,13 @@ type BatchFilesClient interface {
 	// Delete deletes the file in the specified location.
 	Delete(ctx context.Context, fileName, folderName string) (err error)
 
+	// DeletePrefix deletes every file stored under folderName/prefix and
+	// returns the number of deleted files. A prefix with no stored files is
+	// a no-op. The prefix is matched as a directory prefix: a trailing
+	// slash is appended when missing, so sibling directories sharing the
+	// prefix string are left alone.
+	DeletePrefix(ctx context.Context, folderName, prefix string) (deleted int, err error)
+
 	// OpenStream opens a streaming write for the file. It returns
 	// ErrFileExists when the file is already stored. The file becomes
 	// visible to readers only when the returned StreamWriter is committed.

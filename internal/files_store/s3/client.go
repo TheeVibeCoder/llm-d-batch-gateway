@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -45,6 +46,7 @@ type s3API interface {
 	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	DeleteObjects(ctx context.Context, params *s3.DeleteObjectsInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
 	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 	CreateBucket(ctx context.Context, params *s3.CreateBucketInput, optFns ...func(*s3.Options)) (*s3.CreateBucketOutput, error)
 	HeadBucket(ctx context.Context, params *s3.HeadBucketInput, optFns ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
@@ -385,6 +387,68 @@ func (c *Client) Delete(ctx context.Context, fileName, folderName string) error 
 		"bucket", c.bucket, "key", key)
 
 	return nil
+}
+
+// deleteObjectsBatchLimit is S3's maximum number of keys per DeleteObjects
+// call.
+const deleteObjectsBatchLimit = 1000
+
+// DeletePrefix deletes every object under folderName/prefix and returns the
+// number of deleted objects. A prefix with no stored objects is a no-op.
+func (c *Client) DeletePrefix(ctx context.Context, folderName, prefix string) (int, error) {
+	if folderName == "" {
+		return 0, fmt.Errorf("folderName must not be empty")
+	}
+	if prefix == "" {
+		return 0, fmt.Errorf("prefix must not be empty")
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	keyPrefix := c.buildKey(folderName, prefix)
+
+	logger := logr.FromContextOrDiscard(ctx).V(logging.INFO)
+	var deleted int
+	var token *string
+	for {
+		out, err := c.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(c.bucket),
+			Prefix:            aws.String(keyPrefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return deleted, err
+		}
+
+		objects := make([]types.ObjectIdentifier, 0, len(out.Contents))
+		for _, obj := range out.Contents {
+			if obj.Key != nil {
+				objects = append(objects, types.ObjectIdentifier{Key: obj.Key})
+			}
+		}
+		for start := 0; start < len(objects); start += deleteObjectsBatchLimit {
+			end := min(start+deleteObjectsBatchLimit, len(objects))
+			del, err := c.s3Client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+				Bucket: aws.String(c.bucket),
+				Delete: &types.Delete{Objects: objects[start:end], Quiet: aws.Bool(true)},
+			})
+			if err != nil {
+				return deleted, err
+			}
+			for _, e := range del.Errors {
+				logger.Info("Failed to delete object", "key", *e.Key, "message", *e.Message)
+			}
+			deleted += end - start - len(del.Errors)
+		}
+
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+
+	logger.Info("Prefix deleted", "bucket", c.bucket, "prefix", keyPrefix, "objects", deleted)
+	return deleted, nil
 }
 
 // GetContext returns a derived context with a timeout.

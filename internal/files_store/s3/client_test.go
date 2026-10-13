@@ -143,6 +143,17 @@ func (m *mockS3Client) DeleteObject(_ context.Context, params *s3.DeleteObjectIn
 	return &s3.DeleteObjectOutput{}, nil
 }
 
+func (m *mockS3Client) DeleteObjects(_ context.Context, params *s3.DeleteObjectsInput, _ ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error) {
+	if m.delErr != nil {
+		return nil, m.delErr
+	}
+	out := &s3.DeleteObjectsOutput{}
+	for _, id := range params.Delete.Objects {
+		delete(m.objects, *id.Key)
+	}
+	return out, nil
+}
+
 func (m *mockS3Client) ListObjectsV2(_ context.Context, params *s3.ListObjectsV2Input, _ ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
 	if m.listErr != nil {
 		return nil, m.listErr
@@ -379,6 +390,100 @@ func TestDelete(t *testing.T) {
 		err := client.Delete(ctx, "nonexistent.txt", testFolderName)
 		if err != nil {
 			t.Errorf("expected no error, got %v", err)
+		}
+	})
+}
+
+func TestDeletePrefix(t *testing.T) {
+	ctx := context.Background()
+	prefix := "results/job-1/"
+
+	seed := func(t *testing.T) *mockS3Client {
+		t.Helper()
+		mock := newMockS3Client()
+		client := newTestClient(mock)
+		for _, name := range []string{
+			"results/job-1/req-1.jsonl",
+			"results/job-1/req-2.jsonl",
+			"results/job-1/req-2.fallback.jsonl",
+			"results/job-10/req-1.jsonl",
+			"other.txt",
+		} {
+			_, _ = client.Store(ctx, name, testFolderName, 1024, 0, bytes.NewReader([]byte("data")))
+		}
+		return mock
+	}
+
+	t.Run("deletes every object under the prefix", func(t *testing.T) {
+		mock := seed(t)
+		client := newTestClient(mock)
+
+		deleted, err := client.DeletePrefix(ctx, testFolderName, prefix)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if deleted != 3 {
+			t.Errorf("deleted = %d, want 3", deleted)
+		}
+		for _, key := range []string{
+			testFolderName + "/results/job-1/req-1.jsonl",
+			testFolderName + "/results/job-1/req-2.jsonl",
+			testFolderName + "/results/job-1/req-2.fallback.jsonl",
+		} {
+			if _, ok := mock.objects[key]; ok {
+				t.Errorf("expected object %s to be deleted", key)
+			}
+		}
+	})
+
+	t.Run("keeps sibling prefixes sharing the prefix string", func(t *testing.T) {
+		mock := seed(t)
+		client := newTestClient(mock)
+
+		// The trailing slash is missing, but the prefix must still not match
+		// results/job-10/.
+		if _, err := client.DeletePrefix(ctx, testFolderName, "results/job-1"); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if _, ok := mock.objects[testFolderName+"/results/job-10/req-1.jsonl"]; !ok {
+			t.Error("expected sibling object to survive")
+		}
+	})
+
+	t.Run("keeps objects outside the prefix", func(t *testing.T) {
+		mock := seed(t)
+		client := newTestClient(mock)
+
+		if _, err := client.DeletePrefix(ctx, testFolderName, prefix); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		for _, key := range []string{testFolderName + "/results/job-10/req-1.jsonl", testFolderName + "/other.txt"} {
+			if _, ok := mock.objects[key]; !ok {
+				t.Errorf("expected object %s to survive", key)
+			}
+		}
+	})
+
+	t.Run("nonexistent prefix is a no-op", func(t *testing.T) {
+		mock := seed(t)
+		client := newTestClient(mock)
+
+		deleted, err := client.DeletePrefix(ctx, testFolderName, "results/never-seen/")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if deleted != 0 {
+			t.Errorf("deleted = %d, want 0", deleted)
+		}
+	})
+
+	t.Run("returns the list error", func(t *testing.T) {
+		mock := seed(t)
+		mock.listErr = errors.New("list failed")
+		client := newTestClient(mock)
+
+		if _, err := client.DeletePrefix(ctx, testFolderName, prefix); err == nil {
+			t.Fatal("expected error when listing fails")
 		}
 	})
 }

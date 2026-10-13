@@ -172,3 +172,63 @@ func TestOpenStream(t *testing.T) {
 		}
 	})
 }
+
+func TestDeletePrefix(t *testing.T) {
+	ctx := context.Background()
+
+	seed := func(t *testing.T) *MockBatchFilesClient {
+		t.Helper()
+		client := newTestClient(t)
+		for _, name := range []string{
+			"results/job-1/req-1.jsonl",
+			"results/job-1/req-2.jsonl",
+			"results/job-10/req-1.jsonl",
+			"other.txt",
+		} {
+			if _, err := client.Store(ctx, name, "folder", 0, 0, strings.NewReader("data")); err != nil {
+				t.Fatalf("failed to store %s: %v", name, err)
+			}
+		}
+		return client
+	}
+
+	t.Run("deletes every file under the prefix", func(t *testing.T) {
+		client := seed(t)
+
+		deleted, err := client.DeletePrefix(ctx, "folder", "results/job-1/")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if deleted != 2 {
+			t.Errorf("deleted = %d, want 2", deleted)
+		}
+		if _, _, err := client.Retrieve(ctx, "results/job-1/req-1.jsonl", "folder"); err == nil {
+			t.Error("expected req-1.jsonl to be deleted")
+		}
+	})
+
+	t.Run("keeps sibling prefixes and files outside the prefix", func(t *testing.T) {
+		client := seed(t)
+
+		if _, err := client.DeletePrefix(ctx, "folder", "results/job-1"); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		for _, name := range []string{"results/job-10/req-1.jsonl", "other.txt"} {
+			if _, _, err := client.Retrieve(ctx, name, "folder"); err != nil {
+				t.Errorf("expected %s to survive, got err %v", name, err)
+			}
+		}
+	})
+
+	t.Run("nonexistent prefix is a no-op", func(t *testing.T) {
+		client := seed(t)
+
+		deleted, err := client.DeletePrefix(ctx, "folder", "results/never-seen/")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if deleted != 0 {
+			t.Errorf("deleted = %d, want 0", deleted)
+		}
+	})
+}

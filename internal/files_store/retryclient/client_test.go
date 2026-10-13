@@ -33,10 +33,11 @@ import (
 )
 
 type mockFilesClient struct {
-	storeCalls    int
-	retrieveCalls int
-	deleteCalls   int
-	failUntil     int
+	storeCalls        int
+	retrieveCalls     int
+	deleteCalls       int
+	deletePrefixCalls int
+	failUntil         int
 }
 
 func (m *mockFilesClient) Store(_ context.Context, _, _ string, _, _ int64, _ io.Reader) (*api.BatchFileMetadata, error) {
@@ -61,6 +62,14 @@ func (m *mockFilesClient) Delete(_ context.Context, _, _ string) error {
 		return errors.New("transient delete error")
 	}
 	return nil
+}
+
+func (m *mockFilesClient) DeletePrefix(_ context.Context, _, _ string) (int, error) {
+	m.deletePrefixCalls++
+	if m.deletePrefixCalls <= m.failUntil {
+		return 0, errors.New("transient delete prefix error")
+	}
+	return 2, nil
 }
 
 func (m *mockFilesClient) OpenStream(_ context.Context, _, _ string) (api.StreamWriter, error) {
@@ -210,6 +219,22 @@ func TestDelete_SucceedsAfterRetry(t *testing.T) {
 	}
 	if mock.deleteCalls != 3 {
 		t.Fatalf("expected 3 delete calls, got %d", mock.deleteCalls)
+	}
+}
+
+func TestDeletePrefix_SucceedsAfterRetry(t *testing.T) {
+	mock := &mockFilesClient{failUntil: 2}
+	c := New(mock, retryCfg(), "test")
+
+	deleted, err := c.DeletePrefix(context.Background(), "folder", "results/job-1/")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.deletePrefixCalls != 3 {
+		t.Fatalf("expected 3 delete prefix calls, got %d", mock.deletePrefixCalls)
+	}
+	if deleted != 2 {
+		t.Fatalf("expected 2 deleted files, got %d", deleted)
 	}
 }
 

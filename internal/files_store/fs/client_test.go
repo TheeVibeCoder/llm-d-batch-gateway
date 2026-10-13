@@ -373,6 +373,94 @@ func TestDelete(t *testing.T) {
 
 }
 
+func TestDeletePrefix(t *testing.T) {
+	ctx := context.Background()
+	prefix := "results/job-1/"
+
+	seed := func(t *testing.T) *Client {
+		t.Helper()
+		client := newTestClient(t)
+		for _, name := range []string{
+			"results/job-1/req-1.jsonl",
+			"results/job-1/req-2.jsonl",
+			"results/job-1/req-2.fallback.jsonl",
+			"results/job-10/req-1.jsonl",
+			"other.txt",
+		} {
+			if _, err := client.Store(ctx, name, testFolder, 1024, 0, bytes.NewReader([]byte("data"))); err != nil {
+				t.Fatalf("failed to store %s: %v", name, err)
+			}
+		}
+		return client
+	}
+
+	t.Run("deletes every file under the prefix", func(t *testing.T) {
+		client := seed(t)
+
+		deleted, err := client.DeletePrefix(ctx, testFolder, prefix)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if deleted != 3 {
+			t.Errorf("deleted = %d, want 3", deleted)
+		}
+		for _, name := range []string{"results/job-1/req-1.jsonl", "results/job-1/req-2.jsonl", "results/job-1/req-2.fallback.jsonl"} {
+			if _, _, err := client.Retrieve(ctx, name, testFolder); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("expected %s to be deleted, got err %v", name, err)
+			}
+		}
+	})
+
+	t.Run("keeps sibling prefixes sharing the prefix string", func(t *testing.T) {
+		client := seed(t)
+
+		// The trailing slash is missing, but the prefix must still not match
+		// results/job-10/.
+		if _, err := client.DeletePrefix(ctx, testFolder, "results/job-1"); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if _, _, err := client.Retrieve(ctx, "results/job-10/req-1.jsonl", testFolder); err != nil {
+			t.Errorf("expected sibling object to survive, got err %v", err)
+		}
+	})
+
+	t.Run("keeps files outside the prefix", func(t *testing.T) {
+		client := seed(t)
+
+		if _, err := client.DeletePrefix(ctx, testFolder, prefix); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		for _, name := range []string{"results/job-10/req-1.jsonl", "other.txt"} {
+			if _, _, err := client.Retrieve(ctx, name, testFolder); err != nil {
+				t.Errorf("expected %s to survive, got err %v", name, err)
+			}
+		}
+	})
+
+	t.Run("nonexistent prefix is a no-op", func(t *testing.T) {
+		client := seed(t)
+
+		deleted, err := client.DeletePrefix(ctx, testFolder, "results/never-seen/")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if deleted != 0 {
+			t.Errorf("deleted = %d, want 0", deleted)
+		}
+	})
+
+	t.Run("rejects empty folderName and prefix", func(t *testing.T) {
+		client := newTestClient(t)
+
+		if _, err := client.DeletePrefix(ctx, "", prefix); err == nil {
+			t.Error("expected error when folderName is empty")
+		}
+		if _, err := client.DeletePrefix(ctx, testFolder, ""); err == nil {
+			t.Error("expected error when prefix is empty")
+		}
+	})
+}
+
 func TestGetContext(t *testing.T) {
 	t.Run("uses default timeout when zero", func(t *testing.T) {
 		client := newTestClient(t)

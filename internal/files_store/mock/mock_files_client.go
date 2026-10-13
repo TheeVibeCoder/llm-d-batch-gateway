@@ -21,10 +21,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
@@ -268,6 +271,41 @@ func (m *MockBatchFilesClient) Delete(ctx context.Context, fileName, folderName 
 	}
 
 	return nil
+}
+
+// DeletePrefix deletes every file under folderName/prefix and returns the
+// number of deleted files. A prefix with no stored files is a no-op.
+func (m *MockBatchFilesClient) DeletePrefix(ctx context.Context, folderName, prefix string) (int, error) {
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	dirPath := filepath.Join(m.rootDir, folderName, prefix)
+
+	var deleted int
+	err := filepath.WalkDir(dirPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		deleted++
+		return nil
+	})
+	if err != nil {
+		return deleted, fmt.Errorf("failed to delete prefix: %w", err)
+	}
+
+	// Best-effort cleanup of the now-empty directory, like Delete.
+	_ = os.RemoveAll(dirPath)
+
+	return deleted, nil
 }
 
 // GetContext returns a derived context for a call.

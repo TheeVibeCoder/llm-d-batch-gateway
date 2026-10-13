@@ -173,6 +173,25 @@ func (c *Client) Delete(ctx context.Context, fileName, folderName string) error 
 	return err
 }
 
+func (c *Client) DeletePrefix(ctx context.Context, folderName, prefix string) (int, error) {
+	ctx, span := uotel.StartSpan(ctx, "storage.DeletePrefix")
+	defer span.End()
+	span.SetAttributes(
+		c.backend,
+		attribute.String("storage.folder", folderName),
+		attribute.String("storage.prefix", prefix),
+	)
+
+	deleted, err := c.inner.DeletePrefix(ctx, folderName, prefix)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "delete prefix failed")
+		return deleted, err
+	}
+	span.SetAttributes(attribute.Int("storage.deleted_files", deleted))
+	return deleted, nil
+}
+
 func (c *Client) Close() error {
 	return c.inner.Close()
 }

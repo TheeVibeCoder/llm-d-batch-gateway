@@ -22,8 +22,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -313,6 +315,51 @@ func (c *Client) Delete(ctx context.Context, fileName, folderName string) error 
 	}
 
 	return nil
+}
+
+// DeletePrefix deletes every file under folderName/prefix and returns the
+// number of deleted files. A prefix with no stored files is a no-op.
+func (c *Client) DeletePrefix(ctx context.Context, folderName, prefix string) (int, error) {
+	if folderName == "" {
+		return 0, fmt.Errorf("folderName must not be empty")
+	}
+	if prefix == "" {
+		return 0, fmt.Errorf("prefix must not be empty")
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	dir := filepath.Join(folderName, prefix)
+
+	var deleted int
+	err := iofs.WalkDir(c.root.FS(), dir, func(path string, d iofs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if err := c.root.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		deleted++
+		return nil
+	})
+	if err != nil {
+		return deleted, err
+	}
+
+	logger := logr.FromContextOrDiscard(ctx).V(logging.INFO)
+	logger.Info("Prefix deleted", "path", dir, "files", deleted)
+	// Best-effort cleanup of the now-empty directory, like Delete.
+	if err := c.root.Remove(dir); err == nil {
+		logger.Info("Empty directory removed", "dir", dir)
+	}
+
+	return deleted, nil
 }
 
 // GetContext returns a derived context with a timeout.
