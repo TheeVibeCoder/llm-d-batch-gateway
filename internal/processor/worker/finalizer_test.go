@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"errors"
 	"testing"
 
 	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
@@ -160,3 +161,59 @@ func TestStoreFileRecord_NoExpiration_NilExpiresAt(t *testing.T) {
 		t.Fatalf("ExpiresAt = %v, want nil when resolveOutputExpiration returns 0", fileObj.ExpiresAt)
 	}
 }
+
+// TestEnsureFileRecord covers the re-finalization contract of the file-record
+// write: a duplicate insert is tolerated only when the existing record is the
+// same artifact (same tenant, ID, purpose, filename, and size); anything else
+// surfaces the store error.
+func TestEnsureFileRecord(t *testing.T) {
+	const (
+		fileID   = "file_reuse"
+		fileName = "output.jsonl"
+		tenantID = "tenant-1"
+		size     = int64(1024)
+	)
+
+	seedRecord := func(bytes int64) db.FileDBClient {
+		item, err := converter.FileToDBItem(&openai.FileObject{
+			ID:       fileID,
+			Filename: fileName,
+			Bytes:    bytes,
+			Purpose:  openai.FileObjectPurposeBatchOutput,
+			Object:   "file",
+		}, tenantID, db.Tags{})
+		if err != nil {
+			t.Fatalf("FileToDBItem: %v", err)
+		}
+		inner := newMockFileDBClient()
+		if err := inner.DBStore(testLoggerCtx(t), item); err != nil {
+			t.Fatalf("DBStore file item: %v", err)
+		}
+		return inner
+	}
+
+	storeErr := errors.New("db write failed")
+	tests := []struct {
+		name    string
+		files   db.FileDBClient
+		wantErr bool
+	}{
+		{name: "matching record tolerates the duplicate insert", files: &dbStoreErrFileClient{FileDBClient: seedRecord(size), err: storeErr}},
+		{name: "size mismatch surfaces the store error", files: &dbStoreErrFileClient{FileDBClient: seedRecord(2048), err: storeErr}, wantErr: true},
+		{name: "missing record surfaces the store error", files: &dbStoreErrFileClient{FileDBClient: newMockFileDBClient(), err: storeErr}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := mustNewProcessor(t, config.NewConfig(), &clientset.Clientset{FileDB: tt.files})
+
+			err := p.ensureFileRecord(testLoggerCtx(t), fileID, fileName, tenantID, size, db.Tags{})
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("ensureFileRecord error = %v, wantErr %t", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// --- failover file-ID preservation tests ---
+
+// --- parallel upload tests ---

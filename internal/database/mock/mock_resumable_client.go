@@ -362,7 +362,9 @@ func (m *MockResumableStore) ListBatchEntries(ctx context.Context, batchID strin
 			break
 		}
 		if e.Ordinal > afterOrdinal {
-			entries = append(entries, e)
+			// Snapshots, like rows materialized from a Postgres query.
+			entry := *e
+			entries = append(entries, &entry)
 		}
 	}
 	return entries, nil
@@ -373,5 +375,11 @@ func (m *MockResumableStore) FindEntryByRequestID(ctx context.Context, batchID, 
 	defer m.mu.Unlock()
 
 	_, e := m.findEntry(batchID, requestID)
-	return e, nil
+	if e == nil {
+		return nil, nil
+	}
+	// Return a snapshot: the caller reads it after the lock is released while
+	// a fenced checkpoint may still mutate the stored entry.
+	entry := *e
+	return &entry, nil
 }

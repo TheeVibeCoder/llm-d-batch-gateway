@@ -221,7 +221,12 @@ func (m *MockDBClient[T, Q]) DBUpdateProgress(ctx context.Context, id string, ep
 	}
 
 	if existingItem, ok := existing.(*T); ok {
-		val := reflect.ValueOf(existingItem).Elem()
+		// Copy-on-write: the map is thread-safe but the items are not, so the
+		// merged status is published via Store on a shallow copy. SetBytes
+		// swaps the slice header, leaving the previously stored item stable
+		// for readers that loaded it concurrently.
+		item := *existingItem
+		val := reflect.ValueOf(&item).Elem()
 		// Mirror the Postgres epoch fence: items with an Epoch field are only
 		// updated when the caller carries the current epoch; a stale-epoch write
 		// matches no rows, so surface ErrConflict to the caller.
@@ -248,6 +253,7 @@ func (m *MockDBClient[T, Q]) DBUpdateProgress(ctx context.Context, id string, ep
 			}
 			statusField.SetBytes(newStatus)
 		}
+		m.items.Store(id, &item)
 	}
 	return nil
 }

@@ -513,7 +513,7 @@ func TestRunJob_Success_CompletesAndCleansArtifacts(t *testing.T) {
 
 	// Seed BatchDB with the job. The row carries the queue claim a real
 	// dequeue leaves behind; the resumable store is seeded to match it.
-	dbClient := newMockBatchDBClient()
+	dbClient := newSpyBatchDB(newMockBatchDBClient())
 	jobItem := &db.BatchItem{
 		BaseIndexes: db.BaseIndexes{ID: jobID, TenantID: tenantID},
 		BaseContents: db.BaseContents{
@@ -529,6 +529,7 @@ func TestRunJob_Success_CompletesAndCleansArtifacts(t *testing.T) {
 
 	resumable := mockdb.NewMockResumableStore()
 	resumable.SeedBatch(jobID, "test-processor", 1)
+	mirrorResumableStatusWrites(dbClient, resumable)
 
 	p := mustNewProcessor(t, cfg, &clientset.Clientset{
 		BatchDB:   dbClient,
@@ -537,7 +538,7 @@ func TestRunJob_Success_CompletesAndCleansArtifacts(t *testing.T) {
 		Event:     mockdb.NewMockBatchEventChannelClient(),
 		Queue:     mockdb.NewMockBatchPriorityQueueClient(),
 		Inference: inference.NewSingleClientResolver(&mockInferenceClient{}),
-		Resumable: resumable,
+		Resumable: &rowSyncedResumable{MockResumableStore: resumable, rows: dbClient},
 	})
 
 	jobInfo := &batch_types.JobInfo{

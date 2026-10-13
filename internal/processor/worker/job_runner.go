@@ -301,17 +301,21 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "finalize failed")
 		if errors.Is(err, errFinalizeFailedOver) {
-			// finalizeJob already wrote failed status with file IDs preserved.
-			// Calling handleFailed would overwrite file IDs with empty strings.
+			// The finalizer's fallback already wrote failed status with the
+			// artifacts assembled so far; calling handleFailed would overwrite
+			// the file IDs.
 			p.cleanupJobArtifacts(context.Background(), params.jobItem.ID, params.jobItem.TenantID)
 			metrics.RecordJobProcessingDuration(time.Since(jobStart), metrics.GetSizeBucket(int(requestCounts.Total)))
 			recordE2ELatency(params.jobInfo, metrics.E2EStatusFailed)
 			metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
 		} else {
-			// Pre-upload failure (e.g. finalizing status write) — no file IDs exist yet.
-			if failErr := p.handleFailed(ctx, params.updater, params.jobItem, requestCounts, params.jobInfo); failErr != nil {
-				logger.Error(failErr, "Failed to handle failed event")
-			}
+			// The finalization failed before its terminal write and its
+			// fallbacks: the row is still non-terminal and re-finalization is
+			// idempotent, so leave it to the reconciler requeue instead of a
+			// degraded failed write.
+			logger.Info("Leaving job to the reconciler after a failed finalization")
+			metrics.RecordJobProcessingDuration(time.Since(jobStart), metrics.GetSizeBucket(int(requestCounts.Total)))
+			metrics.RecordJobProcessed(metrics.ResultReEnqueued, metrics.ReasonSystemError)
 		}
 		return
 	}
@@ -365,6 +369,36 @@ func (p *Processor) handlePanicRecovery(
 // It is the single decision point for all job-level error routing.
 func (p *Processor) handleJobError(ctx context.Context, params *jobExecutionParams, err error) {
 	logger := logr.FromContextOrDiscard(ctx)
+
+	// A mid-run error on the durable pipeline finalizes through the entry
+	// store: partial artifacts come from the checkpoints and the terminal
+	// write is fenced. The expected status is what the row holds at that
+	// point: the API server flips a cancelling row before the cancel event
+	// is delivered, while an expiry or system error leaves the row at
+	// in_progress (activation wrote it; the in-memory dbJob is stale).
+	// resultSink is set only after activation succeeds, so ingestion-phase
+	// errors keep the legacy routing.
+	if params.resultSink != nil {
+		switch {
+		case errors.Is(err, batchctx.ErrCancelled):
+			if finErr := p.finalizeResumableTerminal(ctx, params, openai.BatchStatusCancelled, batch_types.ErrCodeBatchCancelled, openai.BatchStatusCancelling); finErr != nil {
+				logger.Error(finErr, "Failed to finalize cancelled resumable job")
+			}
+		case errors.Is(err, batchctx.ErrExpired):
+			if finErr := p.finalizeResumableTerminal(ctx, params, openai.BatchStatusExpired, batch_types.ErrCodeBatchExpired, openai.BatchStatusInProgress); finErr != nil {
+				logger.Error(finErr, "Failed to finalize expired resumable job")
+			}
+		case errors.Is(err, batchctx.ErrShutdown):
+			// SIGTERM received — leave the job for the orphan reconciler, same
+			// as the legacy pipeline.
+			logger.V(logging.INFO).Info("SIGTERM received, leaving resumable job for the reconciler")
+		default:
+			if finErr := p.finalizeResumableTerminal(ctx, params, openai.BatchStatusFailed, batch_types.ErrCodeBatchFailed, openai.BatchStatusInProgress); finErr != nil {
+				logger.Error(finErr, "Failed to finalize failed resumable job")
+			}
+		}
+		return
+	}
 
 	switch {
 	case errors.Is(err, batchctx.ErrCancelled):

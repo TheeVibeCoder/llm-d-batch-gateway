@@ -338,10 +338,14 @@ func (p *Processor) recoverExpired(ctx context.Context, dbItem *db.BatchItem, jo
 func (p *Processor) routeResumedPickup(ctx context.Context, params *jobExecutionParams) bool {
 	logger := logr.FromContextOrDiscard(ctx)
 
+	// The row was fetched fresh at dequeue, so its status is the fence's
+	// expected status: the pickup terminalizes what it just read.
+	expected := p.getJobStatus(params.jobItem)
+
 	var status openai.BatchStatus
 	var notExecutedCode batch_types.BatchErrorCode
 	switch {
-	case p.getJobStatus(params.jobItem) == openai.BatchStatusCancelling:
+	case expected == openai.BatchStatusCancelling:
 		status, notExecutedCode = openai.BatchStatusCancelled, batch_types.ErrCodeBatchCancelled
 	case batch_utils.IsJobExpired(params.task):
 		status, notExecutedCode = openai.BatchStatusExpired, batch_types.ErrCodeBatchExpired
@@ -352,38 +356,7 @@ func (p *Processor) routeResumedPickup(ctx context.Context, params *jobExecution
 	}
 
 	logger.V(logging.INFO).Info("Resumable pickup routed to terminal finalization", "status", status)
-	err := p.finalizeResumableAs(ctx, params.updater, params.jobItem, params.jobInfo, status, notExecutedCode)
-
-	// Cleanup after the terminal write: if it failed, the local files survive
-	// for the reconciler requeue to retry the pickup.
-	cleanupCtx := context.WithoutCancel(ctx)
-	if err == nil || errors.Is(err, errFinalizeFailedOver) {
-		p.cleanupJobArtifacts(cleanupCtx, params.jobItem.ID, params.jobItem.TenantID)
-	}
-	if err != nil {
-		if errors.Is(err, errFinalizeFailedOver) {
-			// The fallback already wrote failed with whatever artifacts
-			// assembled before the failure.
-			recordE2ELatency(params.jobInfo, metrics.E2EStatusFailed)
-			metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-			return true
-		}
-		logger.Error(err, "Failed to terminalize resumable pickup; leaving the job for the reconciler")
-		return true
-	}
-
-	switch status {
-	case openai.BatchStatusCancelled:
-		recordE2ELatency(params.jobInfo, metrics.E2EStatusCancelled)
-		metrics.RecordCancellation(metrics.CancelPhaseInProgress)
-		metrics.RecordJobProcessed(metrics.ResultSuccess, metrics.ReasonNone)
-	case openai.BatchStatusExpired:
-		recordE2ELatency(params.jobInfo, metrics.E2EStatusExpired)
-		metrics.RecordJobProcessed(metrics.ResultExpired, metrics.ReasonExpiredExecution)
-	default:
-		recordE2ELatency(params.jobInfo, metrics.E2EStatusFailed)
-		metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-	}
+	_ = p.finalizeResumableTerminal(ctx, params, status, notExecutedCode, expected)
 	return true
 }
 

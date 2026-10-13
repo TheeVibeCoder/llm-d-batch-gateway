@@ -73,6 +73,40 @@ func (p *Processor) storeFileRecord(
 	return nil
 }
 
+// ensureFileRecord stores a file record, treating a store failure as success
+// when a matching record already exists for the same deterministic file ID: a
+// re-finalization re-derives the ID, so an earlier incarnation may have
+// committed the record between its artifact commit and its terminal write
+// (a duplicate insert errors in Postgres). Only identity-relevant fields are
+// compared — CreatedAt/ExpiresAt legitimately drift between incarnations.
+func (p *Processor) ensureFileRecord(
+	ctx context.Context,
+	fileID, fileName, tenantID string,
+	size int64,
+	batchTags db.Tags,
+) error {
+	storeErr := p.storeFileRecord(ctx, fileID, fileName, tenantID, size, batchTags)
+	if storeErr == nil {
+		return nil
+	}
+
+	items, _, _, err := p.files.db.DBGet(ctx, &db.FileQuery{BaseQuery: db.BaseQuery{IDs: []string{fileID}}}, true, 0, 1)
+	if err != nil || len(items) != 1 {
+		return storeErr
+	}
+	item := items[0]
+	fileObj, err := converter.DBItemToFile(item)
+	if err != nil {
+		return storeErr
+	}
+	if item.TenantID == tenantID && item.ID == fileID &&
+		item.Purpose == string(openai.FileObjectPurposeBatchOutput) &&
+		fileObj.Filename == fileName && fileObj.Bytes == size {
+		return nil
+	}
+	return storeErr
+}
+
 // resolveOutputExpiration returns the ExpiresAt timestamp for an output or error file.
 // Priority: user-provided output_expires_after_seconds tag > config default.
 // Returns 0 (no expiration) if neither is set.

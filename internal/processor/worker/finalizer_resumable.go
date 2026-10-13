@@ -17,15 +17,19 @@ limitations under the License.
 package worker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/google/uuid"
 
 	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
@@ -46,9 +50,10 @@ const resumableEntriesPageSize = 500
 // finalizeResumableJob finalizes a durable batch: it streams every entry's
 // checkpointed result object into the output and error artifacts and
 // transitions the batch to completed. Both the finalizing and terminal
-// writes are fenced on the persisted resumable flag, so only the incarnation
-// that still owns the activated batch may terminalize it. Retry-safe
-// finalization of interrupted batches lands with the hardened finalizer.
+// writes are fenced — the finalizing write on the persisted resumable flag,
+// the terminal write on ownership — so only the incarnation that still owns
+// the activated batch may terminalize it, and a crashed incarnation's
+// committed artifacts make re-finalization idempotent.
 func (p *Processor) finalizeResumableJob(
 	ctx context.Context,
 	updater *StatusUpdater,
@@ -87,7 +92,7 @@ func (p *Processor) finalizeResumableJob(
 	// same contract as the legacy finalizer.
 	if errors.Is(context.Cause(ctx), batchctx.ErrCancelled) {
 		logger.V(logging.INFO).Info("Cancel requested during finalization; finalizing as cancelled")
-		if err := updater.UpdateCancelledStatus(ioCtx, dbJob, counts, outputFileID, errorFileID); err != nil {
+		if err := p.finalizeResumableStatus(ioCtx, updater, dbJob, openai.BatchStatusFinalizing, openai.BatchStatusCancelled, counts, outputFileID, errorFileID); err != nil {
 			logger.Error(err, "Failed to update cancelled status, falling back to failed with file IDs preserved")
 			if failErr := updater.UpdateFailedStatus(ioCtx, dbJob, counts, outputFileID, errorFileID); failErr != nil {
 				return fmt.Errorf("failed to update job status to cancelled (%w) and fallback to failed also failed: %w", err, failErr)
@@ -99,7 +104,7 @@ func (p *Processor) finalizeResumableJob(
 	}
 
 	// finalizing → completed
-	if err := updater.UpdateCompletedStatus(ioCtx, dbJob, counts, outputFileID, errorFileID); err != nil {
+	if err := p.finalizeResumableStatus(ioCtx, updater, dbJob, openai.BatchStatusFinalizing, openai.BatchStatusCompleted, counts, outputFileID, errorFileID); err != nil {
 		logger.Error(err, "Failed to update job status to completed, falling back to failed with file IDs preserved")
 		if failErr := updater.UpdateFailedStatus(ioCtx, dbJob, counts, outputFileID, errorFileID); failErr != nil {
 			return fmt.Errorf("failed to update job status to completed (%w) and fallback to failed also failed: %w", err, failErr)
@@ -114,11 +119,15 @@ func (p *Processor) finalizeResumableJob(
 
 // finalizeResumableAs terminalizes a durable batch that must not resume
 // execution — a requeued row that is cancelling, past its SLO, or past its
-// recovery budget. It streams the checkpointed artifacts (non-terminal
-// entries become not-executed error lines) and writes the given terminal
-// status. Cleanup and metrics belong to the caller. A failed terminal write
-// returns the error: the row stays non-terminal and the reconciler requeues
-// it, so the pickup is retried instead of degraded.
+// recovery budget, or an activated batch whose run aborted (cancel, expiry,
+// system error). It streams the checkpointed artifacts (non-terminal entries
+// become not-executed error lines) and writes the given terminal status.
+// expected is the row status the finalizer believes it is terminalizing —
+// the fenced terminal write is refused when the row disagrees, so a stale
+// belief cannot overwrite a row another writer moved. Cleanup and metrics
+// belong to the caller. A failed terminal write returns the error: the row
+// stays non-terminal and the reconciler requeues it, so the finalization is
+// retried instead of degraded.
 func (p *Processor) finalizeResumableAs(
 	ctx context.Context,
 	updater *StatusUpdater,
@@ -126,6 +135,7 @@ func (p *Processor) finalizeResumableAs(
 	jobInfo *batch_types.JobInfo,
 	status openai.BatchStatus,
 	notExecutedCode batch_types.BatchErrorCode,
+	expected openai.BatchStatus,
 ) error {
 	logger := logr.FromContextOrDiscard(ctx)
 	logger.V(logging.INFO).Info("Terminalizing resumable job without resuming execution", "status", status)
@@ -147,17 +157,8 @@ func (p *Processor) finalizeResumableAs(
 		return fmt.Errorf("assemble resumable artifacts: %w", errFinalizeFailedOver)
 	}
 
-	var writeErr error
-	switch status {
-	case openai.BatchStatusCancelled:
-		writeErr = updater.UpdateCancelledStatus(ioCtx, dbJob, counts, outputFileID, errorFileID)
-	case openai.BatchStatusExpired:
-		writeErr = updater.UpdateExpiredStatus(ioCtx, dbJob, counts, outputFileID, errorFileID)
-	default:
-		writeErr = updater.UpdateFailedStatus(ioCtx, dbJob, counts, outputFileID, errorFileID)
-	}
-	if writeErr != nil {
-		return fmt.Errorf("update job status to %s: %w", status, writeErr)
+	if err := p.finalizeResumableStatus(ioCtx, updater, dbJob, expected, status, counts, outputFileID, errorFileID); err != nil {
+		return fmt.Errorf("update job status to %s: %w", status, err)
 	}
 
 	setRequestCountAttrs(ctx, counts)
@@ -166,11 +167,115 @@ func (p *Processor) finalizeResumableAs(
 	return nil
 }
 
+// finalizeResumableTerminal terminalizes a durable batch and records the
+// outcome: finalization as the given status with partial artifacts (via
+// notExecutedCode for non-terminal entries), local-artifact cleanup once the
+// row is terminal, and the per-status metrics. It is the shared tail of the
+// pickup routing and the durable runJob error branches. An error other than
+// errFinalizeFailedOver leaves the row non-terminal for the reconciler
+// requeue, so the finalization is retried.
+func (p *Processor) finalizeResumableTerminal(
+	ctx context.Context,
+	params *jobExecutionParams,
+	status openai.BatchStatus,
+	notExecutedCode batch_types.BatchErrorCode,
+	expected openai.BatchStatus,
+) error {
+	logger := logr.FromContextOrDiscard(ctx)
+
+	err := p.finalizeResumableAs(ctx, params.updater, params.jobItem, params.jobInfo, status, notExecutedCode, expected)
+
+	// Cleanup after the terminal write: if it failed, the local files survive
+	// for the reconciler requeue to retry the finalization.
+	if err == nil || errors.Is(err, errFinalizeFailedOver) {
+		p.cleanupJobArtifacts(context.WithoutCancel(ctx), params.jobItem.ID, params.jobItem.TenantID)
+	}
+	if err != nil {
+		if errors.Is(err, errFinalizeFailedOver) {
+			// The fallback already wrote failed with whatever artifacts
+			// assembled before the failure.
+			recordE2ELatency(params.jobInfo, metrics.E2EStatusFailed)
+			metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
+			return err
+		}
+		logger.Error(err, "Failed to terminalize resumable job; leaving it for the reconciler")
+		return err
+	}
+
+	switch status {
+	case openai.BatchStatusCancelled:
+		recordE2ELatency(params.jobInfo, metrics.E2EStatusCancelled)
+		metrics.RecordCancellation(metrics.CancelPhaseInProgress)
+		metrics.RecordJobProcessed(metrics.ResultSuccess, metrics.ReasonNone)
+	case openai.BatchStatusExpired:
+		recordE2ELatency(params.jobInfo, metrics.E2EStatusExpired)
+		metrics.RecordJobProcessed(metrics.ResultExpired, metrics.ReasonExpiredExecution)
+	default:
+		recordE2ELatency(params.jobInfo, metrics.E2EStatusFailed)
+		metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
+	}
+	return nil
+}
+
+// finalizeResumableStatus performs the fenced terminal transition of a
+// durable batch: it builds the terminal status document from dbJob's current
+// status and hands it to FinalizeResumableBatch, which commits the document
+// atomically with the ownership release (resumable cleared, owner and lease
+// dropped). expected is the row status the transition is fenced on. A
+// conflict propagates wrapped, so runJob can route it to the
+// ownership-lost path.
+func (p *Processor) finalizeResumableStatus(
+	ctx context.Context,
+	updater *StatusUpdater,
+	dbJob *db.BatchItem,
+	expected, terminal openai.BatchStatus,
+	counts *openai.BatchRequestCounts,
+	outputFileID, errorFileID string,
+) error {
+	doc, err := updater.BuildStatus(dbJob, terminal, counts, nil, withFileIDs(outputFileID, errorFileID))
+	if err != nil {
+		return err
+	}
+	if err := p.resumable.FinalizeResumableBatch(ctx, &db.ResumableFinalization{
+		BatchID:        dbJob.ID,
+		ProcessorID:    p.processorID,
+		Epoch:          dbJob.Epoch,
+		ExpectedStatus: string(expected),
+		Status:         doc,
+	}); err != nil {
+		return fmt.Errorf("fenced terminal status write (%s → %s): %w", expected, terminal, err)
+	}
+	dbJob.Status = doc
+
+	// The entry objects are baked into the final artifacts and cascade with
+	// the row; purge the result prefix so the objects do not outlive the
+	// batch. Best-effort — the GC's prefix purge backstops a process that
+	// dies between the terminal write and this call.
+	p.purgeResultObjects(ctx, dbJob.ID, dbJob.TenantID)
+	return nil
+}
+
+// purgeResultObjects deletes the batch's checkpointed result objects.
+func (p *Processor) purgeResultObjects(ctx context.Context, jobID, tenantID string) {
+	logger := logr.FromContextOrDiscard(ctx)
+	folder, err := ucom.GetFolderNameByTenantID(tenantID)
+	if err != nil {
+		logger.Error(err, "Failed to resolve result prefix for purge")
+		return
+	}
+	prefix := "results/" + jobID + "/"
+	if _, err := p.files.storage.DeletePrefix(ctx, folder, prefix); err != nil {
+		logger.Error(err, "Failed to purge result objects", "prefix", prefix)
+	}
+}
+
 // assembleResumableArtifacts streams every entry's result object, in input
 // order, into the batch's output and error artifacts and returns the final
-// request counts and file IDs. Each object's size and SHA-256 are verified
-// while streaming. Artifact file IDs are derived from the batch, so a
-// re-finalization targets the same keys.
+// request counts and file IDs. Each page's objects are prefetched and
+// verified (size and SHA-256) with bounded concurrency — resumable.
+// finalize_concurrency parallel fetches — and then written in ordinal order.
+// Artifact file IDs are derived from the batch, so a re-finalization
+// targets the same keys.
 //
 // notExecutedCode renders non-terminal entries as synthetic not-executed
 // error lines, for terminalizing a batch that must not resume execution; an
@@ -215,7 +320,29 @@ func (p *Processor) assembleResumableArtifacts(
 		if len(entries) == 0 {
 			break
 		}
-		for _, e := range entries {
+		// Prefetch the page's result objects with bounded concurrency; the
+		// writes below stay in ordinal order.
+		fetched := make([][]byte, len(entries))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(p.cfg.Resumable.FinalizeConcurrency)
+		for i, e := range entries {
+			if !e.Status.IsTerminal() {
+				continue
+			}
+			g.Go(func() error {
+				buf, err := fetchResult(gctx, p.files.storage, folder, e)
+				if err != nil {
+					return err
+				}
+				fetched[i] = buf
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return nil, "", "", err
+		}
+
+		for i, e := range entries {
 			afterOrdinal = e.Ordinal
 			counts.Total++
 			var w *artifactWriter
@@ -244,7 +371,7 @@ func (p *Processor) assembleResumableArtifacts(
 				}
 				continue
 			}
-			if err := w.streamEntry(ctx, e); err != nil {
+			if err := w.writeResult(ctx, fetched[i]); err != nil {
 				return nil, "", "", err
 			}
 		}
@@ -266,20 +393,46 @@ func (p *Processor) assembleResumableArtifacts(
 
 // artifactWriter lazily opens and finally commits one finalization artifact.
 // An artifact with no entries is never created; its file ID stays empty.
+//
+// A re-finalization of a batch whose earlier incarnation committed the
+// artifact (crash between artifact commit and terminal write) re-derives the
+// same key, so OpenStream refuses with ErrFileExists: the writer then runs in
+// existing mode — no bytes are written, but what this incarnation would write
+// is hashed and counted, then verified against the stored object at commit.
 type artifactWriter struct {
-	storage filesapi.BatchFilesClient
-	folder  string
-	key     string
-	fileID  string
-	writer  filesapi.StreamWriter
+	storage  filesapi.BatchFilesClient
+	folder   string
+	key      string
+	fileID   string
+	writer   filesapi.StreamWriter
+	existing bool
+	hasher   hash.Hash
+	count    int64
 }
 
-// ensure opens the stream writer on first use.
+// Write implements io.Writer, routing to the open stream or, in existing
+// mode, to the digest accumulator.
+func (w *artifactWriter) Write(p []byte) (int, error) {
+	if w.existing {
+		w.hasher.Write(p)
+		w.count += int64(len(p))
+		return len(p), nil
+	}
+	return w.writer.Write(p)
+}
+
+// ensure opens the stream writer on first use, or enters existing mode when
+// the artifact is already committed.
 func (w *artifactWriter) ensure(ctx context.Context) error {
-	if w.writer != nil {
+	if w.writer != nil || w.existing {
 		return nil
 	}
 	writer, err := w.storage.OpenStream(ctx, w.key, w.folder)
+	if errors.Is(err, filesapi.ErrFileExists) {
+		w.existing = true
+		w.hasher = sha256.New()
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("open artifact stream %s: %w", w.key, err)
 	}
@@ -287,25 +440,36 @@ func (w *artifactWriter) ensure(ctx context.Context) error {
 	return nil
 }
 
-// streamEntry copies one entry's result object into the artifact, verifying
-// its size and SHA-256 while streaming.
-func (w *artifactWriter) streamEntry(ctx context.Context, e *db.ResumableEntry) error {
-	if err := w.ensure(ctx); err != nil {
-		return err
-	}
-	reader, _, err := w.storage.Retrieve(ctx, e.ResultKey, w.folder)
+// fetchResult retrieves one entry's result object and verifies it against
+// the entry row's recorded size and SHA-256.
+func fetchResult(ctx context.Context, storage filesapi.BatchFilesClient, folder string, e *db.ResumableEntry) ([]byte, error) {
+	reader, _, err := storage.Retrieve(ctx, e.ResultKey, folder)
 	if err != nil {
-		return fmt.Errorf("retrieve result %s: %w", e.ResultKey, err)
+		return nil, fmt.Errorf("retrieve result %s: %w", e.ResultKey, err)
 	}
 	defer reader.Close()
 
-	hasher := sha256.New()
-	size, err := io.Copy(io.MultiWriter(w.writer, hasher), reader)
+	buf, err := io.ReadAll(reader)
 	if err != nil {
-		return fmt.Errorf("stream result %s: %w", e.ResultKey, err)
+		return nil, fmt.Errorf("read result %s: %w", e.ResultKey, err)
 	}
-	if size != e.ResultBytes || hex.EncodeToString(hasher.Sum(nil)) != e.ResultSHA256 {
-		return fmt.Errorf("result %s failed integrity check: got %d bytes, want %d", e.ResultKey, size, e.ResultBytes)
+	if int64(len(buf)) != e.ResultBytes {
+		return nil, fmt.Errorf("result %s failed integrity check: got %d bytes, want %d", e.ResultKey, len(buf), e.ResultBytes)
+	}
+	sum := sha256.Sum256(buf)
+	if hex.EncodeToString(sum[:]) != e.ResultSHA256 {
+		return nil, fmt.Errorf("result %s failed integrity check: digest mismatch", e.ResultKey)
+	}
+	return buf, nil
+}
+
+// writeResult writes one prefetched, verified result line into the artifact.
+func (w *artifactWriter) writeResult(ctx context.Context, line []byte) error {
+	if err := w.ensure(ctx); err != nil {
+		return err
+	}
+	if _, err := w.Write(line); err != nil {
+		return fmt.Errorf("write artifact %s: %w", w.key, err)
 	}
 	return nil
 }
@@ -329,15 +493,26 @@ func (w *artifactWriter) writeNotExecuted(ctx context.Context, e *db.ResumableEn
 		return fmt.Errorf("marshal not-executed line for %s: %w", e.RequestID, err)
 	}
 	lineBytes = append(lineBytes, '\n')
-	if _, err := w.writer.Write(lineBytes); err != nil {
+	if _, err := w.Write(lineBytes); err != nil {
 		return fmt.Errorf("write not-executed line for %s: %w", e.RequestID, err)
 	}
 	return nil
 }
 
 // commit finalizes the artifact and records its file ID; a writer that never
-// opened contributes no file.
+// opened contributes no file. The file record is ensured rather than stored:
+// on re-finalization the earlier incarnation may have committed it between
+// its artifact commit and its terminal write.
 func (w *artifactWriter) commit(ctx context.Context, p *Processor, dbJob *db.BatchItem, jobInfo *batch_types.JobInfo, fileName string) (string, error) {
+	if w.existing {
+		if err := w.verifyExisting(ctx); err != nil {
+			return "", err
+		}
+		if err := p.ensureFileRecord(ctx, w.fileID, fileName, jobInfo.TenantID, w.count, dbJob.Tags); err != nil {
+			return "", err
+		}
+		return w.fileID, nil
+	}
 	if w.writer == nil {
 		return "", nil
 	}
@@ -346,10 +521,32 @@ func (w *artifactWriter) commit(ctx context.Context, p *Processor, dbJob *db.Bat
 		return "", fmt.Errorf("commit artifact %s: %w", w.key, err)
 	}
 	w.writer = nil
-	if err := p.storeFileRecord(ctx, w.fileID, fileName, jobInfo.TenantID, md.Size, dbJob.Tags); err != nil {
+	if err := p.ensureFileRecord(ctx, w.fileID, fileName, jobInfo.TenantID, md.Size, dbJob.Tags); err != nil {
 		return "", err
 	}
 	return w.fileID, nil
+}
+
+// verifyExisting re-reads the committed artifact and checks it matches the
+// bytes this incarnation would have written. The artifact key is derived
+// from the batch and file type, so a match proves the stored object holds
+// this batch's artifact rather than a colliding leftover.
+func (w *artifactWriter) verifyExisting(ctx context.Context) error {
+	reader, _, err := w.storage.Retrieve(ctx, w.key, w.folder)
+	if err != nil {
+		return fmt.Errorf("retrieve committed artifact %s: %w", w.key, err)
+	}
+	defer reader.Close()
+
+	hasher := sha256.New()
+	size, err := io.Copy(hasher, reader)
+	if err != nil {
+		return fmt.Errorf("stream committed artifact %s: %w", w.key, err)
+	}
+	if size != w.count || !bytes.Equal(hasher.Sum(nil), w.hasher.Sum(nil)) {
+		return fmt.Errorf("committed artifact %s does not match re-derived content: got %d bytes, want %d", w.key, size, w.count)
+	}
+	return nil
 }
 
 // abort discards the write; a no-op after a successful commit.

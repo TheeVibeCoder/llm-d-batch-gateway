@@ -259,6 +259,9 @@ type spyBatchDB struct {
 	inner db.BatchProgressDBClient
 	mu    sync.Mutex
 	calls map[openai.BatchStatus]int
+	// onUpdate, when set, fires after a successful inner DBUpdate with the
+	// replacement item.
+	onUpdate func(*db.BatchItem)
 }
 
 func newSpyBatchDB(inner db.BatchProgressDBClient) *spyBatchDB {
@@ -285,7 +288,13 @@ func (s *spyBatchDB) DBUpdate(ctx context.Context, item *db.BatchItem, expectedS
 			s.mu.Unlock()
 		}
 	}
-	return s.inner.DBUpdate(ctx, item, expectedStatus)
+	if err := s.inner.DBUpdate(ctx, item, expectedStatus); err != nil {
+		return err
+	}
+	if s.onUpdate != nil {
+		s.onUpdate(item)
+	}
+	return nil
 }
 
 func (s *spyBatchDB) DBDelete(ctx context.Context, IDs []string) ([]string, error) {
@@ -508,6 +517,24 @@ func activateJobEntries(t *testing.T, p *Processor, jobID, tenantID string, cust
 	return sink, &db.BatchItem{
 		BaseIndexes: db.BaseIndexes{ID: jobID, TenantID: tenantID},
 		Epoch:       1,
+	}
+}
+
+// mirrorResumableStatusWrites wires the mock batch DB to mirror resumable-
+// fenced row writes into the mock resumable store's status: production
+// commits the fenced status and the row in one statement, the mocks are
+// split.
+func mirrorResumableStatusWrites(dbClient db.BatchProgressDBClient, resumable *mockdb.MockResumableStore) {
+	if s, ok := dbClient.(*spyBatchDB); ok {
+		s.onUpdate = func(item *db.BatchItem) {
+			if item.ExpectedResumable == nil || !*item.ExpectedResumable {
+				return
+			}
+			var st openai.BatchStatusInfo
+			if err := json.Unmarshal(item.Status, &st); err == nil {
+				resumable.SetBatchStatus(item.ID, string(st.Status))
+			}
+		}
 	}
 }
 
