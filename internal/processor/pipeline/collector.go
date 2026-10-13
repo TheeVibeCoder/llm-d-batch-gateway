@@ -3,6 +3,8 @@ package pipeline
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -24,8 +26,29 @@ type outputLine struct {
 
 const fileBufferSize = 1024 * 1024
 
-func (o *outputLine) isSuccess() bool {
-	return o.Error == nil && o.Response != nil && o.Response.StatusCode == 200
+// Succeeded reports whether a result is a success line: no error object and
+// an HTTP 200 response. It matches the outputLine classification.
+func (r *ResultItem) Succeeded() bool {
+	return r.Error == nil && r.Response != nil && r.Response.StatusCode == 200
+}
+
+// MarshalResultLine renders one result as an output JSONL line (with its
+// trailing newline) and returns the line bytes, its SHA-256 hex digest, and
+// its size in bytes — the metadata the durable pipeline checkpoints per entry.
+func MarshalResultLine(msg *ResultItem) ([]byte, string, int64, error) {
+	line := &outputLine{
+		ID:       msg.RequestID,
+		CustomID: msg.CustomID,
+		Response: msg.Response,
+		Error:    msg.Error,
+	}
+	lineBytes, err := json.Marshal(line)
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("marshal output for %s: %w", msg.RequestID, err)
+	}
+	lineBytes = append(lineBytes, '\n')
+	sum := sha256.Sum256(lineBytes)
+	return lineBytes, hex.EncodeToString(sum[:]), int64(len(lineBytes)), nil
 }
 
 // ResultCollector writes ResultItem values to JSONL and records progress.
@@ -88,44 +111,41 @@ func (c *ResultCollector) Drain(ctx context.Context, resultCh <-chan ResultItem)
 }
 
 func (c *ResultCollector) Receive(msg ResultItem) error {
-	line := &outputLine{
-		ID:       msg.RequestID,
-		CustomID: msg.CustomID,
-		Response: msg.Response,
-		Error:    msg.Error,
-	}
-
-	lineBytes, err := json.Marshal(line)
+	lineBytes, _, _, err := MarshalResultLine(&msg)
 	if err != nil {
-		return fmt.Errorf("marshal output for %s: %w", msg.RequestID, err)
+		return err
 	}
-	lineBytes = append(lineBytes, '\n')
 
 	w := c.output
-	if line.Error != nil {
+	if msg.Error != nil {
 		w = c.errors
 	}
 	if _, err := w.Write(lineBytes); err != nil {
 		return fmt.Errorf("write output for %s: %w", msg.RequestID, err)
 	}
 
-	if line.isSuccess() {
+	if msg.Succeeded() {
 		c.tracker.RecordSuccess(msg)
 		if msg.Response != nil {
 			recordTokenUsage(msg.Response.Body, msg.ModelID, c.logger)
 		}
 	} else {
 		code := "unknown"
-		if line.Error != nil {
-			code = line.Error.Code
-		} else if line.Response != nil {
-			code = fmt.Sprintf("http_%d", line.Response.StatusCode)
+		if msg.Error != nil {
+			code = msg.Error.Code
+		} else if msg.Response != nil {
+			code = fmt.Sprintf("http_%d", msg.Response.StatusCode)
 		}
 		c.tracker.RecordFailure(fmt.Errorf("%s: %s", msg.RequestID, code))
 		metrics.RecordRequestError(msg.ModelID)
 	}
 
 	return nil
+}
+
+// setPersistenceFailureHook arms the executor's persistence-failure abort.
+func (c *ResultCollector) setPersistenceFailureHook(fn func()) {
+	c.onPersistenceFailure = fn
 }
 
 func recordTokenUsage(body map[string]any, model string, logger logr.Logger) {

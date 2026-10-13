@@ -8,6 +8,77 @@ import (
 	"time"
 )
 
+func TestPendingRequests_Enrich(t *testing.T) {
+	t.Run("enriches from pending map and keeps the entry pending", func(t *testing.T) {
+		p := NewPendingRequests(0)
+		submitted := time.Now()
+		p.Store(RequestItem{RequestID: "r1", CustomID: "c1", ModelID: "m1", SubmittedAt: submitted})
+
+		result := &ResultItem{RequestID: "r1"}
+		if !p.Enrich(result) {
+			t.Fatal("Enrich returned false for pending request")
+		}
+		if result.CustomID != "c1" || result.ModelID != "m1" || !result.SubmittedAt.Equal(submitted) {
+			t.Fatalf("enriched result = %+v", result)
+		}
+		if _, ok := p.m.Load("r1"); !ok {
+			t.Fatal("Enrich removed the pending entry")
+		}
+	})
+
+	t.Run("accepts error result for pending request without removing it", func(t *testing.T) {
+		p := NewPendingRequests(0)
+		p.Store(RequestItem{RequestID: "r1", CustomID: "c1"})
+
+		result := &ResultItem{RequestID: "r1", Error: &OutputError{Code: "server_error", Message: "boom"}}
+		if !p.Enrich(result) {
+			t.Fatal("Enrich returned false for pending error result")
+		}
+		if _, ok := p.m.Load("r1"); !ok {
+			t.Fatal("Enrich removed the pending entry")
+		}
+	})
+
+	t.Run("accepts results that already carry metadata", func(t *testing.T) {
+		p := NewPendingRequests(0)
+		if !p.Enrich(&ResultItem{RequestID: "r1", CustomID: "c1"}) {
+			t.Fatal("Enrich rejected result with CustomID")
+		}
+		if !p.Enrich(&ResultItem{RequestID: "r1", CustomID: "c1", Error: &OutputError{Code: "x", Message: "y"}}) {
+			t.Fatal("Enrich rejected inline error with CustomID")
+		}
+	})
+
+	t.Run("rejects unknown broadcast result", func(t *testing.T) {
+		p := NewPendingRequests(0)
+		if p.Enrich(&ResultItem{RequestID: "other-job"}) {
+			t.Fatal("Enrich accepted result from another job")
+		}
+		if p.Enrich(&ResultItem{RequestID: "other-job", Error: &OutputError{Code: "x", Message: "y"}}) {
+			t.Fatal("Enrich accepted error result from another job")
+		}
+	})
+
+	t.Run("resolve after enrich completes the cycle", func(t *testing.T) {
+		p := NewPendingRequests(0)
+		p.Store(RequestItem{RequestID: "r1", CustomID: "c1"})
+
+		result := &ResultItem{RequestID: "r1"}
+		if !p.Enrich(result) {
+			t.Fatal("Enrich returned false")
+		}
+		if !p.Resolve(result) {
+			t.Fatal("Resolve returned false after Enrich")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		p.Wait(ctx)
+		if ctx.Err() != nil {
+			t.Fatal("Wait blocked after Enrich + Resolve")
+		}
+	})
+}
+
 func TestPendingRequests(t *testing.T) {
 	t.Run("resolve enriches result with request metadata", func(t *testing.T) {
 		p := NewPendingRequests(0)

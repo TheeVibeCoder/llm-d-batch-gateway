@@ -11,11 +11,19 @@ import (
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 )
 
+// resultHandler consumes results from resultCh until it closes. It stays
+// inside package pipeline: the unexported hook method lets the executor arm
+// the persistence-failure dispatch cancel for every handler kind.
+type resultHandler interface {
+	Drain(ctx context.Context, resultCh <-chan ResultItem) error
+	setPersistenceFailureHook(fn func())
+}
+
 // JobExecutor orchestrates the execution pipeline.
 type JobExecutor struct {
 	source     RequestSource
 	dispatcher RequestDispatcher
-	collector  *ResultCollector
+	collector  resultHandler
 	tracker    *ProgressTracker
 	logger     logr.Logger
 }
@@ -23,7 +31,7 @@ type JobExecutor struct {
 type JobExecutorConfig struct {
 	Source     RequestSource
 	Dispatcher RequestDispatcher
-	Collector  *ResultCollector
+	Collector  resultHandler
 	Tracker    *ProgressTracker
 	Logger     logr.Logger
 }
@@ -44,7 +52,7 @@ func (je *JobExecutor) Execute(ctx context.Context) (*openai.BatchRequestCounts,
 	dispatchCtx, dispatchCancel := context.WithCancel(ctx)
 	defer dispatchCancel()
 
-	je.collector.onPersistenceFailure = sync.OnceFunc(dispatchCancel)
+	je.collector.setPersistenceFailureHook(sync.OnceFunc(dispatchCancel))
 
 	requestCh := make(chan RequestItem)
 	resultCh := make(chan ResultItem, defaultResultBuffer)

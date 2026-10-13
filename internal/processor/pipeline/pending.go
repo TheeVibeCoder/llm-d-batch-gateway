@@ -45,6 +45,31 @@ func (p *PendingRequests) decrement() {
 	}
 }
 
+// Enrich attaches request metadata to a result while it stays pending.
+// Returns the same acceptance verdict as Resolve: either the result already
+// has metadata (cancels, inline errors) or it was found in the pending map.
+// The durable pipeline calls this on arrival and Resolve only after the
+// result's checkpoint succeeded, so a failed checkpoint leaves the request
+// pending for a later resume.
+func (p *PendingRequests) Enrich(result *ResultItem) bool {
+	if result.Error != nil {
+		if _, ok := p.m.Load(result.RequestID); ok {
+			return true
+		}
+		return result.CustomID != ""
+	}
+	if result.CustomID != "" {
+		return true
+	}
+	if msg, ok := p.m.Load(result.RequestID); ok {
+		result.CustomID = msg.CustomID
+		result.ModelID = msg.ModelID
+		result.SubmittedAt = msg.SubmittedAt
+		return true
+	}
+	return false
+}
+
 // Resolve enriches a result with request metadata. Returns true if the
 // result is accepted: either it already has metadata (cancels, inline errors)
 // or it was found in the pending map (async inference results).

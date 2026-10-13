@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-logr/logr"
 
+	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
@@ -20,6 +21,12 @@ type AsyncDispatcher struct {
 	broadcasters *BroadcasterGroup
 	pending      *PendingRequests
 	logger       logr.Logger
+	// beforeSubmit, when set, runs immediately before each submission. A
+	// db.ErrConflict return means the submitter no longer owns the batch: the
+	// dispatcher stops submitting (but keeps draining) so a zombie does not
+	// stream the remaining requests into the queue. Any other error is routed
+	// to the per-request error path like a submit failure.
+	beforeSubmit func(msg *RequestItem) error
 }
 
 var _ RequestDispatcher = (*AsyncDispatcher)(nil)
@@ -38,15 +45,38 @@ func NewAsyncDispatcher(
 	}
 }
 
+// WithBeforeSubmit installs a pre-submit hook (see AsyncDispatcher.beforeSubmit).
+func (d *AsyncDispatcher) WithBeforeSubmit(fn func(msg *RequestItem) error) *AsyncDispatcher {
+	d.beforeSubmit = fn
+	return d
+}
+
 func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem, resultCh chan<- ResultItem) error {
 	d.broadcasters.Subscribe(resultCh)
 
 	// Submit phase — fast queue writes.
+	var stopSubmitting bool
 	for msg := range requestCh {
+		if stopSubmitting {
+			// Ownership was lost mid-stream: drain the channel without
+			// submitting so the source is not left blocked on a send.
+			continue
+		}
 		client := d.resolver.SharedClientFor(msg.ModelID)
 		if client == nil {
 			resultCh <- *msg.ModelNotFound()
 			continue
+		}
+
+		if d.beforeSubmit != nil {
+			if err := d.beforeSubmit(&msg); err != nil {
+				if errors.Is(err, db.ErrConflict) {
+					stopSubmitting = true
+					continue
+				}
+				resultCh <- *msg.Error("server_error", err.Error())
+				continue
+			}
 		}
 
 		d.pending.Store(msg)

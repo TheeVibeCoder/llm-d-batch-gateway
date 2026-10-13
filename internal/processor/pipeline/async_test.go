@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-logr/logr"
 
+	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
@@ -722,4 +723,154 @@ func TestAsyncCancellation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
+	newEnv := func(t *testing.T) (*fakeAsyncClient, *inference.AsyncGatewayResolver, *BroadcasterGroup) {
+		t.Helper()
+		client := newFakeAsyncClient()
+		client.submittedCh = make(chan struct{})
+		resolver := inference.NewTestAsyncResolver(map[string]func() inference.AsyncInferenceClient{
+			"m1": func() inference.AsyncInferenceClient { return client },
+		})
+		t.Cleanup(func() { _ = resolver.Close() })
+
+		broadcaster := NewResultBroadcaster(client, logr.Discard())
+		broadcasters := NewBroadcasterGroup([]*ResultBroadcaster{broadcaster})
+		broadcasterCtx, broadcasterCancel := context.WithCancel(context.Background())
+		broadcasterDone := make(chan struct{})
+		t.Cleanup(func() {
+			broadcasterCancel()
+			<-broadcasterDone
+		})
+		go func() {
+			defer close(broadcasterDone)
+			broadcaster.Run(broadcasterCtx)
+		}()
+		return client, resolver, broadcasters
+	}
+
+	items := func() []RequestItem {
+		return []RequestItem{
+			{RequestID: "req-1", CustomID: "c-1", ModelID: "m1", Endpoint: "/v1/chat/completions"},
+			{RequestID: "req-2", CustomID: "c-2", ModelID: "m1", Endpoint: "/v1/chat/completions"},
+			{RequestID: "req-3", CustomID: "c-3", ModelID: "m1", Endpoint: "/v1/chat/completions"},
+		}
+	}
+
+	t.Run("ownership conflict stops submitting but keeps draining", func(t *testing.T) {
+		client, resolver, broadcasters := newEnv(t)
+
+		pending := NewPendingRequests(0)
+		outputFile := tempFile(t)
+		errorFile := tempFile(t)
+		tracker := NewProgressTracker(3, nil, "test-job", 0, logr.Discard())
+		collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
+
+		dispatcher := NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard()).
+			WithBeforeSubmit(func(msg *RequestItem) error {
+				if msg.RequestID != "req-1" {
+					return fmt.Errorf("mark in-flight %s: %w", msg.RequestID, db.ErrConflict)
+				}
+				return nil
+			})
+
+		executor := NewJobExecutor(JobExecutorConfig{
+			Source:     &sliceSource{items: items()},
+			Dispatcher: dispatcher,
+			Collector:  collector,
+			Tracker:    tracker,
+			Logger:     logr.Discard(),
+		})
+
+		// The dispatcher stops submitting after the conflict; deliver the one
+		// submitted result so the run terminates instead of blocking on it.
+		go func() {
+			<-client.submittedCh
+			client.deliver("req-1", map[string]any{"ok": true})
+		}()
+
+		// A deadlock (dispatcher blocked on an undrained source or an
+		// unresolved pending entry) surfaces as the deadline firing.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		counts, err := executor.Execute(ctx)
+		if err != nil {
+			t.Fatalf("Execute() error: %v", err)
+		}
+
+		client.mu.Lock()
+		submitted := len(client.submitted)
+		client.mu.Unlock()
+		if submitted != 1 {
+			t.Errorf("submitted requests = %d, want 1 (submission stops after ownership loss)", submitted)
+		}
+		if counts.Completed != 1 || counts.Failed != 0 {
+			t.Errorf("counts = completed %d / failed %d, want 1 / 0", counts.Completed, counts.Failed)
+		}
+		if lines := countLines(readFile(t, outputFile)); lines != 1 {
+			t.Errorf("output lines = %d, want 1", lines)
+		}
+	})
+
+	t.Run("non-conflict error routes to the per-request error path", func(t *testing.T) {
+		client, resolver, broadcasters := newEnv(t)
+
+		pending := NewPendingRequests(0)
+		outputFile := tempFile(t)
+		errorFile := tempFile(t)
+		tracker := NewProgressTracker(3, nil, "test-job", 0, logr.Discard())
+		collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
+
+		dispatcher := NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard()).
+			WithBeforeSubmit(func(msg *RequestItem) error {
+				if msg.RequestID == "req-2" {
+					return errors.New("db down")
+				}
+				return nil
+			})
+
+		executor := NewJobExecutor(JobExecutorConfig{
+			Source:     &sliceSource{items: items()},
+			Dispatcher: dispatcher,
+			Collector:  collector,
+			Tracker:    tracker,
+			Logger:     logr.Discard(),
+		})
+
+		go func() {
+			for range 2 {
+				<-client.submittedCh
+			}
+			client.deliver("req-1", map[string]any{"ok": true})
+			client.deliver("req-3", map[string]any{"ok": true})
+		}()
+
+		counts, err := executor.Execute(context.Background())
+		if err != nil {
+			t.Fatalf("Execute() error: %v", err)
+		}
+
+		client.mu.Lock()
+		submitted := len(client.submitted)
+		client.mu.Unlock()
+		if submitted != 2 {
+			t.Errorf("submitted requests = %d, want 2 (only req-2 is rejected)", submitted)
+		}
+		if counts.Completed != 2 || counts.Failed != 1 {
+			t.Errorf("counts = completed %d / failed %d, want 2 / 1", counts.Completed, counts.Failed)
+		}
+
+		errorLines := splitLines(readFile(t, errorFile))
+		if len(errorLines) != 1 {
+			t.Fatalf("error lines = %d, want 1", len(errorLines))
+		}
+		var errLine outputLine
+		if err := json.Unmarshal(errorLines[0], &errLine); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if errLine.Error == nil || errLine.Error.Code != "server_error" {
+			t.Fatalf("expected server_error, got %+v", errLine.Error)
+		}
+	})
 }
