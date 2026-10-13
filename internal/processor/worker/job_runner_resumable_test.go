@@ -33,6 +33,7 @@ import (
 	mockfiles "github.com/llm-d/llm-d-batch-gateway/internal/files_store/mock"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/config"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/metrics"
+	"github.com/llm-d/llm-d-batch-gateway/internal/processor/pipeline"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/converter"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
@@ -60,22 +61,13 @@ func durableInputLine(model, customID string) string {
 	return fmt.Sprintf(`{"custom_id":%q,"method":"POST","url":"/v1/chat/completions","body":{"model":%q,"messages":[{"role":"user","content":"hi"}]}}`+"\n", customID, model)
 }
 
-// setupDurableJob seeds a validating batch and wires a processor for the
-// durable pipeline: an async resolver with "test-model" registered (every
-// other model is rejected at ingestion), a mock resumable store seeded with
-// the processor's claim, and manually-wired result broadcasters (Run wires
-// them in production).
-func setupDurableJob(t *testing.T, jobID string, models []string) *durableJobEnv {
+// seedDurableInput writes the batch input file for the given models into a
+// fresh mock file store and records its file DB item, returning the store's
+// root and the file DB client.
+func seedDurableInput(t *testing.T, tenantID, inputFileID string, models []string) (string, db.FileDBClient) {
 	t.Helper()
-	ctx := testLoggerCtx(t)
 
-	const tenantID = "tenant-1"
-	inputFileID := "file-input-" + jobID
-
-	cfg := config.NewConfig()
-	cfg.WorkDir = t.TempDir()
 	filesRoot := t.TempDir()
-
 	folderName, err := ucom.GetFolderNameByTenantID(tenantID)
 	if err != nil {
 		t.Fatalf("GetFolderNameByTenantID: %v", err)
@@ -104,9 +96,27 @@ func setupDurableJob(t *testing.T, jobID string, models []string) *durableJobEnv
 	if err != nil {
 		t.Fatalf("FileToDBItem: %v", err)
 	}
-	if err := fileDBClient.DBStore(ctx, fileItem); err != nil {
+	if err := fileDBClient.DBStore(testLoggerCtx(t), fileItem); err != nil {
 		t.Fatalf("DBStore file item: %v", err)
 	}
+	return filesRoot, fileDBClient
+}
+
+// setupDurableJob seeds a validating batch and wires a processor for the
+// durable pipeline: an async resolver with "test-model" registered (every
+// other model is rejected at ingestion), a mock resumable store seeded with
+// the processor's claim, and manually-wired result broadcasters (Run wires
+// them in production).
+func setupDurableJob(t *testing.T, jobID string, models []string) *durableJobEnv {
+	t.Helper()
+	ctx := testLoggerCtx(t)
+
+	const tenantID = "tenant-1"
+	inputFileID := "file-input-" + jobID
+
+	cfg := config.NewConfig()
+	cfg.WorkDir = t.TempDir()
+	filesRoot, fileDBClient := seedDurableInput(t, tenantID, inputFileID, models)
 
 	dbClient := newMockBatchDBClient()
 	jobItem := &db.BatchItem{
@@ -193,6 +203,126 @@ func (e *durableJobEnv) runJob(t *testing.T) {
 		jobInfo: e.jobInfo,
 		task:    &db.BatchJobPriority{ID: e.jobItem.ID, SLO: time.Now().Add(1 * time.Hour)},
 	})
+}
+
+// runResumedJobAsync launches runJob for a requeued resumable task and returns
+// a channel closed when it returns. The token and logger context are taken on
+// the caller's goroutine so a staging failure fails the test, not the spawned
+// one.
+func (e *durableJobEnv) runResumedJobAsync(t *testing.T, task *db.BatchJobPriority) <-chan struct{} {
+	t.Helper()
+	if !e.p.acquire(context.Background()) {
+		t.Fatalf("expected token acquire before runJob")
+	}
+	ctx := testLoggerCtx(t)
+	done := make(chan struct{})
+	e.p.wg.Add(1)
+	go func() {
+		defer close(done)
+		e.p.runJob(ctx, &jobExecutionParams{
+			updater: NewStatusUpdater(e.dbClient),
+			jobItem: e.jobItem,
+			jobInfo: e.jobInfo,
+			task:    task,
+		})
+	}()
+	return done
+}
+
+// runResumedJob runs runJob synchronously with a requeued resumable task —
+// the delivery shape of the unified dequeue.
+func (e *durableJobEnv) runResumedJob(t *testing.T, task *db.BatchJobPriority) {
+	t.Helper()
+	<-e.runResumedJobAsync(t, task)
+}
+
+// pendingLineEntry builds the activation entry of one unfinished input line.
+func pendingLineEntry(jobID, customID string, ordinal int64) db.ResumableActivationEntry {
+	return db.ResumableActivationEntry{
+		RequestID: stableBatchRequestID(jobID, customID),
+		Ordinal:   ordinal,
+		CustomID:  customID,
+		Status:    string(db.ResumableEntryPending),
+	}
+}
+
+// storeCheckpointedResult stores a previous incarnation's result object for
+// one input line at its canonical key, returning its key, SHA-256, and size.
+func storeCheckpointedResult(t *testing.T, filesClient *mockfiles.MockBatchFilesClient, tenantID, jobID, customID string) (string, string, int64) {
+	t.Helper()
+	reqID := stableBatchRequestID(jobID, customID)
+	line, digest, size, err := pipeline.MarshalResultLine(&pipeline.ResultItem{
+		RequestID: reqID,
+		CustomID:  customID,
+		Response: &batch_types.ResponseData{
+			StatusCode: 200,
+			RequestID:  reqID,
+			Body:       map[string]any{"choices": []any{map[string]any{"text": "earlier-incarnation"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal seeded result for %s: %v", customID, err)
+	}
+	folder, err := ucom.GetFolderNameByTenantID(tenantID)
+	if err != nil {
+		t.Fatalf("GetFolderNameByTenantID: %v", err)
+	}
+	key := resumableResultKey(jobID, reqID)
+	if _, err := filesClient.Store(testLoggerCtx(t), key, folder, 0, 0, bytes.NewReader(line)); err != nil {
+		t.Fatalf("store seeded result object %s: %v", key, err)
+	}
+	return key, digest, size
+}
+
+// checkpointedLineEntry stores a previous incarnation's result object for one
+// input line at its canonical key and returns the activation entry that
+// checkpoints it.
+func checkpointedLineEntry(t *testing.T, env *durableJobEnv, jobID, customID string, ordinal int64) db.ResumableActivationEntry {
+	t.Helper()
+	key, digest, size := storeCheckpointedResult(t, env.filesClient, env.jobInfo.TenantID, jobID, customID)
+	return db.ResumableActivationEntry{
+		RequestID:    stableBatchRequestID(jobID, customID),
+		Ordinal:      ordinal,
+		CustomID:     customID,
+		Status:       string(db.ResumableEntryCompleted),
+		ResultKey:    key,
+		ResultBytes:  size,
+		ResultSHA256: digest,
+	}
+}
+
+// stageResumedClaim stages the mock resumable store at the state the unified
+// dequeue leaves behind after re-claiming a requeued row: the processor owns
+// the batch at the given epoch with the given (partially checkpointed) entry
+// set. The requeue/claim bookkeeping itself is PG-tested — the mock cannot
+// express a claim over an already-activated batch.
+func (e *durableJobEnv) stageResumedClaim(t *testing.T, epoch int64, entries ...db.ResumableActivationEntry) {
+	t.Helper()
+	e.resumable.SeedBatch(e.jobItem.ID, e.jobItem.ProcessorID, epoch)
+	err := e.resumable.ActivateResumableBatch(testLoggerCtx(t), &db.ResumableActivation{
+		BatchID:     e.jobItem.ID,
+		ProcessorID: e.jobItem.ProcessorID,
+		Epoch:       epoch,
+		LeaseTTL:    time.Minute,
+		Entries:     entries,
+	})
+	if err != nil {
+		t.Fatalf("stage resumed claim: %v", err)
+	}
+}
+
+// durableJobStatus fetches the batch's persisted status info.
+func durableJobStatus(t *testing.T, env *durableJobEnv) openai.BatchStatusInfo {
+	t.Helper()
+	items, _, _, err := env.dbClient.DBGet(context.Background(), &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{env.jobItem.ID}}}, true, 0, 1)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DBGet %s: err=%v len=%d", env.jobItem.ID, err, len(items))
+	}
+	var status openai.BatchStatusInfo
+	if err := json.Unmarshal(items[0].Status, &status); err != nil {
+		t.Fatalf("unmarshal status for %s: %v", env.jobItem.ID, err)
+	}
+	return status
 }
 
 // readArtifactLines retrieves and parses one finalization artifact.
@@ -360,10 +490,11 @@ func TestRunJob_Resumable_ActivationConflict_LeavesJobValidating(t *testing.T) {
 }
 
 // TestRunPollingLoop_ResumableRouting covers the polling loop's handling of a
-// claimed requeued resumable task (task.Resumable): terminal routing is
-// deferred to the resume path in runJob, a processor without the durable
-// pipeline skips it fail-closed, and the shutdown guard requeues it through
-// the resumable store instead of the legacy enqueue.
+// claimed requeued resumable task (task.Resumable): the loop hands it to
+// runJob whose pickup routing terminalizes terminal-bound rows with partial
+// artifacts, a processor without the durable pipeline skips it fail-closed,
+// and the shutdown guard requeues it through the resumable store instead of
+// the legacy enqueue.
 func TestRunPollingLoop_ResumableRouting(t *testing.T) {
 	t.Run("sync processor skips the task without a terminal write", func(t *testing.T) {
 		ctx := testLoggerCtx(t)
@@ -417,25 +548,30 @@ func TestRunPollingLoop_ResumableRouting(t *testing.T) {
 		}
 	})
 
-	t.Run("durable processor defers terminal routing to runJob", func(t *testing.T) {
+	t.Run("durable pickup terminalizes a cancelling row with partial artifacts", func(t *testing.T) {
 		const jobID = "job-resumable-poll-route"
 		ctx := testLoggerCtx(t)
 
-		env := setupDurableJob(t, jobID, []string{"test-model"})
+		env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
 
-		// A requeued cancelling row: without routing, the poll loop would
-		// transition it to cancelled itself. Fence this processor out of the
-		// activation so runJob aborts via handleOwnershipLost — the new owner
-		// owns the terminal transition, so no status may be written at all.
+		// A requeued cancelling row whose previous incarnation checkpointed
+		// one of two results. The poll loop must not terminalize it itself —
+		// runJob's pickup routing owns the durable finalize: the completed
+		// entry's object lands in the output artifact, the pending entry
+		// becomes a not-executed cancelled line, and nothing is dispatched.
 		env.jobItem.Spec = mustJSON(t, openai.BatchSpec{
 			InputFileID: "file-input-" + jobID,
 			Endpoint:    openai.EndpointChatCompletions,
 		})
 		env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusCancelling})
+		env.jobItem.Epoch = 2
 		if err := env.dbClient.DBStore(ctx, env.jobItem); err != nil {
 			t.Fatalf("DBStore job item: %v", err)
 		}
-		env.resumable.SeedBatch(jobID, "test-processor", 42)
+		env.stageResumedClaim(t, 2,
+			checkpointedLineEntry(t, env, jobID, "req-1", 0),
+			pendingLineEntry(jobID, "req-2", 1),
+		)
 
 		if err := env.pqClient.PQEnqueue(ctx, &db.BatchJobPriority{
 			ID:        jobID,
@@ -453,7 +589,35 @@ func TestRunPollingLoop_ResumableRouting(t *testing.T) {
 		}
 		env.p.wg.Wait()
 
-		assertJobStatus(t, env.dbClient, jobID, openai.BatchStatusCancelling)
+		status := durableJobStatus(t, env)
+		if status.Status != openai.BatchStatusCancelled {
+			t.Fatalf("status = %s, want cancelled", status.Status)
+		}
+		wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 1, Failed: 1}
+		if status.RequestCounts != wantCounts {
+			t.Fatalf("counts = %+v, want %+v", status.RequestCounts, wantCounts)
+		}
+
+		// Output artifact: the checkpointed object of the completed entry.
+		outLines := readArtifactLines(t, env,
+			ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeOutput), jobOutputStorageName(jobID)))
+		if len(outLines) != 1 || outLines[0].ID != stableBatchRequestID(jobID, "req-1") {
+			t.Fatalf("output artifact = %+v, want the checkpointed req-1 line", outLines)
+		}
+
+		// Error artifact: the pending entry as a not-executed cancelled line.
+		errLines := readArtifactLines(t, env,
+			ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeError), jobErrorStorageName(jobID)))
+		if len(errLines) != 1 || errLines[0].ID != stableBatchRequestID(jobID, "req-2") {
+			t.Fatalf("error artifact = %+v, want the not-executed req-2 line", errLines)
+		}
+		if errLines[0].Error == nil || errLines[0].Error.Code != string(batch_types.ErrCodeBatchCancelled) {
+			t.Fatalf("error line is not batch_cancelled: %+v", errLines[0])
+		}
+
+		if got := env.asyncClient.submitCount(); got != 0 {
+			t.Fatalf("submitted requests = %d, want 0 (a terminal-bound pickup dispatches nothing)", got)
+		}
 	})
 
 	t.Run("shutdown guard requeues through the resumable store", func(t *testing.T) {
@@ -513,6 +677,273 @@ func TestRunPollingLoop_ResumableRouting(t *testing.T) {
 			t.Fatalf("enqueue calls = %d, want only the seed (legacy re-enqueue must be skipped)", calls)
 		}
 	})
+}
+
+// TestRunJob_Resumable_PickupRouting covers the terminal-bound pickup matrix
+// of a requeued resumable task: every branch finalizes with partial artifacts
+// (non-terminal entries become not-executed error lines) in its terminal
+// status, without dispatching anything.
+func TestRunJob_Resumable_PickupRouting(t *testing.T) {
+	tests := []struct {
+		name           string
+		stage          func(env *durableJobEnv, task *db.BatchJobPriority)
+		want           openai.BatchStatus
+		wantNotExecVer batch_types.BatchErrorCode
+	}{
+		{
+			name: "SLO-expired pickup finalizes as expired",
+			stage: func(env *durableJobEnv, task *db.BatchJobPriority) {
+				task.SLO = time.Now().Add(-1 * time.Second)
+			},
+			want:           openai.BatchStatusExpired,
+			wantNotExecVer: batch_types.ErrCodeBatchExpired,
+		},
+		{
+			name: "exhausted recovery budget finalizes as failed",
+			stage: func(env *durableJobEnv, task *db.BatchJobPriority) {
+				env.jobItem.RecoveryAttempts = maxRecoveryAttempts + 1
+			},
+			want:           openai.BatchStatusFailed,
+			wantNotExecVer: batch_types.ErrCodeBatchFailed,
+		},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			jobID := fmt.Sprintf("job-resumable-route-%d", i)
+
+			env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
+			env.jobItem.Spec = mustJSON(t, openai.BatchSpec{
+				InputFileID: "file-input-" + jobID,
+				Endpoint:    openai.EndpointChatCompletions,
+			})
+			env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress})
+			env.jobItem.Epoch = 2
+
+			task := &db.BatchJobPriority{
+				ID:        jobID,
+				SLO:       time.Now().Add(1 * time.Hour),
+				Epoch:     2,
+				Resumable: true,
+			}
+			tt.stage(env, task)
+
+			if err := env.dbClient.DBStore(testLoggerCtx(t), env.jobItem); err != nil {
+				t.Fatalf("DBStore job item: %v", err)
+			}
+			env.stageResumedClaim(t, 2,
+				checkpointedLineEntry(t, env, jobID, "req-1", 0),
+				pendingLineEntry(jobID, "req-2", 1),
+			)
+
+			env.runResumedJob(t, task)
+
+			status := durableJobStatus(t, env)
+			if status.Status != tt.want {
+				t.Fatalf("status = %s, want %s", status.Status, tt.want)
+			}
+			wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 1, Failed: 1}
+			if status.RequestCounts != wantCounts {
+				t.Fatalf("counts = %+v, want %+v", status.RequestCounts, wantCounts)
+			}
+
+			outLines := readArtifactLines(t, env,
+				ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeOutput), jobOutputStorageName(jobID)))
+			if len(outLines) != 1 || outLines[0].ID != stableBatchRequestID(jobID, "req-1") {
+				t.Fatalf("output artifact = %+v, want the checkpointed req-1 line", outLines)
+			}
+
+			errLines := readArtifactLines(t, env,
+				ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeError), jobErrorStorageName(jobID)))
+			if len(errLines) != 1 || errLines[0].ID != stableBatchRequestID(jobID, "req-2") {
+				t.Fatalf("error artifact = %+v, want the not-executed req-2 line", errLines)
+			}
+			if errLines[0].Error == nil || errLines[0].Error.Code != string(tt.wantNotExecVer) {
+				t.Fatalf("error line code = %+v, want %s", errLines[0].Error, tt.wantNotExecVer)
+			}
+
+			if got := env.asyncClient.submitCount(); got != 0 {
+				t.Fatalf("submitted requests = %d, want 0 (a terminal-bound pickup dispatches nothing)", got)
+			}
+		})
+	}
+}
+
+// TestRunJob_Resumable_ResumeSkipsCheckpointedEntries verifies the resumed
+// incarnation of a requeued batch end to end: the persisted entry set passes
+// the manifest integrity check, checkpointed entries are skipped at the source
+// (never re-dispatched), and finalization streams both incarnations' result
+// objects into one artifact in input order.
+func TestRunJob_Resumable_ResumeSkipsCheckpointedEntries(t *testing.T) {
+	const jobID = "job-resumable-resume"
+
+	env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
+
+	// The previous incarnation checkpointed req-1 before dying; the requeued
+	// row was re-claimed at epoch 2 (the requeue/claim bookkeeping is
+	// PG-tested — the mock stages the claimed state directly).
+	env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress})
+	env.jobItem.Epoch = 2
+	if err := env.dbClient.DBStore(testLoggerCtx(t), env.jobItem); err != nil {
+		t.Fatalf("DBStore job item: %v", err)
+	}
+	env.stageResumedClaim(t, 2,
+		checkpointedLineEntry(t, env, jobID, "req-1", 0),
+		pendingLineEntry(jobID, "req-2", 1),
+	)
+
+	done := env.runResumedJobAsync(t, &db.BatchJobPriority{
+		ID:        jobID,
+		SLO:       time.Now().Add(1 * time.Hour),
+		Epoch:     2,
+		Resumable: true,
+	})
+
+	// Answer every submitted request — the resumed run must submit only the
+	// unfinished entry — until the run returns.
+	go func() {
+		for {
+			select {
+			case req := <-env.asyncClient.submittedCh:
+				env.asyncClient.deliver(req.RequestID, map[string]any{"choices": []any{map[string]any{"text": "ok"}}})
+			case <-done:
+				return
+			}
+		}
+	}()
+	<-done
+
+	status := durableJobStatus(t, env)
+	if status.Status != openai.BatchStatusCompleted {
+		t.Fatalf("status = %s, want completed", status.Status)
+	}
+	wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 2, Failed: 0}
+	if status.RequestCounts != wantCounts {
+		t.Fatalf("counts = %+v, want %+v", status.RequestCounts, wantCounts)
+	}
+
+	// Only the unfinished entry was re-dispatched.
+	if got := env.asyncClient.submitCount(); got != 1 {
+		t.Fatalf("submitted requests = %d, want 1", got)
+	}
+
+	// Output artifact: both incarnations' objects, in input order.
+	outLines := readArtifactLines(t, env,
+		ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeOutput), jobOutputStorageName(jobID)))
+	if len(outLines) != 2 {
+		t.Fatalf("output artifact lines = %d, want 2", len(outLines))
+	}
+	wantIDs := []string{stableBatchRequestID(jobID, "req-1"), stableBatchRequestID(jobID, "req-2")}
+	for i, want := range wantIDs {
+		if outLines[i].ID != want {
+			t.Fatalf("output line %d id = %s, want %s", i, outLines[i].ID, want)
+		}
+	}
+	// Line 0 carries the object the earlier incarnation checkpointed; line 1
+	// this run's result.
+	for i, wantText := range []string{"earlier-incarnation", "ok"} {
+		choices, ok := outLines[i].Response.Body["choices"].([]any)
+		if !ok || len(choices) != 1 {
+			t.Fatalf("output line %d body = %+v, want one choice", i, outLines[i].Response.Body)
+		}
+		if text, ok := choices[0].(map[string]any)["text"]; !ok || text != wantText {
+			t.Fatalf("output line %d choice text = %v, want %q", i, text, wantText)
+		}
+	}
+}
+
+// TestRunJob_Resumable_IntegrityMismatchFailsTheJob verifies that a persisted
+// entry set that no longer matches the manifest re-derived from the input file
+// fails the job instead of resuming a diverged batch.
+func TestRunJob_Resumable_IntegrityMismatchFailsTheJob(t *testing.T) {
+	const jobID = "job-resumable-integrity"
+
+	env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
+
+	// The input has two lines but only one entry survived: allowlist drift
+	// between incarnations must be caught, not resumed.
+	env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress})
+	env.jobItem.Epoch = 2
+	if err := env.dbClient.DBStore(testLoggerCtx(t), env.jobItem); err != nil {
+		t.Fatalf("DBStore job item: %v", err)
+	}
+	env.stageResumedClaim(t, 2, checkpointedLineEntry(t, env, jobID, "req-1", 0))
+
+	env.runResumedJob(t, &db.BatchJobPriority{
+		ID:        jobID,
+		SLO:       time.Now().Add(1 * time.Hour),
+		Epoch:     2,
+		Resumable: true,
+	})
+
+	assertJobStatus(t, env.dbClient, jobID, openai.BatchStatusFailed)
+	if got := env.asyncClient.submitCount(); got != 0 {
+		t.Fatalf("submitted requests = %d, want 0 (a diverged batch must not resume)", got)
+	}
+}
+
+// TestRunJob_Resumable_MidRunOwnershipLoss verifies the zombie-abort contract
+// when ownership is taken away mid-run: the fenced checkpoint surfaces
+// db.ErrConflict, runJob aborts via handleOwnershipLost, and no terminal write
+// or entry mutation happens — the new owner owns the batch's terminal state.
+func TestRunJob_Resumable_MidRunOwnershipLoss(t *testing.T) {
+	const jobID = "job-resumable-midrun-fence"
+
+	env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
+
+	env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress})
+	env.jobItem.Epoch = 2
+	if err := env.dbClient.DBStore(testLoggerCtx(t), env.jobItem); err != nil {
+		t.Fatalf("DBStore job item: %v", err)
+	}
+	env.stageResumedClaim(t, 2,
+		pendingLineEntry(jobID, "req-1", 0),
+		pendingLineEntry(jobID, "req-2", 1),
+	)
+
+	done := env.runResumedJobAsync(t, &db.BatchJobPriority{
+		ID:        jobID,
+		SLO:       time.Now().Add(1 * time.Hour),
+		Epoch:     2,
+		Resumable: true,
+	})
+
+	// Let the run dispatch both entries, then take ownership away the way the
+	// GC reconciler does, and answer the results: their checkpoints must
+	// fence out and abort the run.
+	var submitted []string
+	for range 2 {
+		req := <-env.asyncClient.submittedCh
+		submitted = append(submitted, req.RequestID)
+	}
+	if err := env.resumable.RequeueResumableOrphan(context.Background(), jobID, env.jobItem.ProcessorID, 2, false); err != nil {
+		t.Fatalf("RequeueResumableOrphan: %v", err)
+	}
+	for _, id := range submitted {
+		env.asyncClient.deliver(id, map[string]any{"choices": []any{map[string]any{"text": "late"}}})
+	}
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("runJob did not return after the fenced checkpoint")
+	}
+
+	// No terminal write: the row stays in_progress for the new owner.
+	assertJobStatus(t, env.dbClient, jobID, openai.BatchStatusInProgress)
+
+	// Ownership was released to the requeue state; nothing was checkpointed
+	// after the takeover.
+	owner, epoch, attempts := env.resumable.BatchOwnership(jobID)
+	if owner != "" || epoch != 3 || attempts != 1 {
+		t.Fatalf("ownership = (%q, %d, %d), want released at epoch 3 with 1 attempt", owner, epoch, attempts)
+	}
+	state, err := env.resumable.EntryResumeState(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("EntryResumeState: %v", err)
+	}
+	if state.Completed != 0 || state.Failed != 0 || state.InFlight != 2 {
+		t.Fatalf("entry state = %+v, want 2 in-flight and nothing checkpointed", state)
+	}
 }
 
 func TestRenewBatchLease(t *testing.T) {

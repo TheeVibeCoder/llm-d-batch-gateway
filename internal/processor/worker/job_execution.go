@@ -48,5 +48,10 @@ type jobExecutionParams struct {
 	// after resumable activation succeeds.
 	resultSink *batchResultStore
 
+	// resumeSeed, when set, carries the checkpointed entry counts of previous
+	// incarnations: executeJobAsync seeds the progress tracker with them and
+	// skips their request IDs at the source instead of re-dispatching.
+	resumeSeed *db.ResumableResumeState
+
 	requestCounts *openai.BatchRequestCounts
 }

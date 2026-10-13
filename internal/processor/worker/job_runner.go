@@ -102,6 +102,16 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 
 	jobStart := time.Now()
 
+	// A requeued resumable task converges here from the unified dequeue and
+	// the startup requeue. Terminal-bound states (cancelling, SLO-expired,
+	// recovery budget exhausted) finalize with partial artifacts before any
+	// execution; everything else resumes through the normal pipeline.
+	if params.task != nil && params.task.Resumable {
+		if p.routeResumedPickup(ctx, params) {
+			return
+		}
+	}
+
 	// event watcher for cancel event
 	eventWatcher, err := p.event.ECConsumerGetChannel(ctx, params.jobInfo.JobID)
 	if err != nil {
@@ -113,7 +123,15 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 		if params.task != nil {
 			bgCtx, bgSpan := uotel.DetachedContext(ctx, "re-enqueue")
 			defer bgSpan.End()
-			if enqErr := p.poller.enqueueOne(bgCtx, params.task); enqErr != nil {
+			if params.task.Resumable {
+				// PQEnqueue refuses resumable rows; hand the batch back the
+				// way the reconciler does so the dequeue can reclaim it.
+				if reqErr := p.resumable.RequeueResumableOrphan(bgCtx, params.task.ID, params.jobItem.ProcessorID, params.jobItem.Epoch, false); reqErr != nil {
+					logger.Error(reqErr, "Failed to requeue the resumable job; leaving it to the reconciler")
+				} else {
+					metrics.RecordJobProcessed(metrics.ResultReEnqueued, metrics.ReasonSystemError)
+				}
+			} else if enqErr := p.poller.enqueueOne(bgCtx, params.task); enqErr != nil {
 				logger.Error(enqErr, "Failed to re-enqueue the job to the queue")
 				if failErr := p.handleFailed(bgCtx, params.updater, params.jobItem, nil, params.jobInfo); failErr != nil {
 					logger.Error(failErr, "Failed to mark job as failed after re-enqueue failure")
@@ -186,14 +204,24 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 
 	// Take ownership of the batch with the fenced activation (entries +
 	// lease) instead of a plain status write; losing that race means another
-	// incarnation owns the batch.
-	sink, err := p.activateResumable(abortCtx, params, manifest)
+	// incarnation owns the batch. A requeued task skips the activation — its
+	// entry set already exists — and rebuilds the sink and resume seed from
+	// the checkpointed entries instead.
+	var (
+		sink *batchResultStore
+		seed *db.ResumableResumeState
+	)
+	if params.task != nil && params.task.Resumable {
+		sink, seed, err = p.recoverResumable(abortCtx, params, manifest)
+	} else {
+		sink, err = p.activateResumable(abortCtx, params, manifest)
+	}
 	if err != nil {
 		if errors.Is(err, db.ErrConflict) {
 			p.handleOwnershipLost(ctx, params)
 			return
 		}
-		logger.Error(err, "Failed to activate resumable batch")
+		logger.Error(err, "Failed to activate or resume resumable batch")
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "activation failed")
 		if failErr := p.handleFailed(ctx, params.updater, params.jobItem, nil, params.jobInfo); failErr != nil {
@@ -202,6 +230,7 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 		return
 	}
 	params.resultSink = sink
+	params.resumeSeed = seed
 	transitionedToInProgress = true
 	// Keep the ownership lease alive until runJob returns. Registered after
 	// the abortCause defer so it fires first on unwind (LIFO): the renewal
@@ -221,10 +250,11 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 	execSpan.End()
 	params.requestCounts = requestCounts
 	// A neutral abort (context.Canceled — i.e. not expired/cancelled/shutdown)
-	// means a fenced progress write revealed we lost ownership. Stop here WITHOUT
-	// a terminal write: the job now belongs to another processor, which owns the
+	// means a fenced progress write revealed we lost ownership; so does an
+	// ErrConflict surfaced by a fenced checkpoint. Stop here WITHOUT a
+	// terminal write: the job now belongs to another processor, which owns the
 	// terminal transition.
-	if abortCtx.Err() != nil && batchctx.Cause(abortCtx) == nil {
+	if (abortCtx.Err() != nil && batchctx.Cause(abortCtx) == nil) || errors.Is(execErr, db.ErrConflict) {
 		p.handleOwnershipLost(ctx, params)
 		if requestCounts != nil {
 			metrics.RecordJobProcessingDuration(time.Since(jobStart), metrics.GetSizeBucket(int(requestCounts.Total)))
@@ -246,6 +276,15 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 	// finalization: final counts and artifacts are derived from the entry set.
 	finErr := p.finalizeResumableJob(abortCtx, params.updater, params.jobItem, params.jobInfo)
 	if err := finErr; err != nil {
+		if errors.Is(err, db.ErrConflict) {
+			// A fenced finalization write means another incarnation owns the
+			// batch; it owns the terminal transition.
+			p.handleOwnershipLost(ctx, params)
+			if requestCounts != nil {
+				metrics.RecordJobProcessingDuration(time.Since(jobStart), metrics.GetSizeBucket(int(requestCounts.Total)))
+			}
+			return
+		}
 		if errors.Is(err, batchctx.ErrCancelled) {
 			// Cancel arrived during finalization — DB already updated to cancelled.
 			// Treat as successful cancellation (same as handleCancelled).

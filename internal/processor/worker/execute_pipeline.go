@@ -104,7 +104,15 @@ func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionPar
 		progressInterval,
 		logger,
 	)
-	tracker.AddFailed(modelMap.RejectedCount)
+	if params.resumeSeed != nil {
+		// A resumed batch starts from its checkpointed counts. Terminal
+		// entries include the activation-rejected ones, which were seeded as
+		// failed at activation — RejectedCount must not be added again.
+		tracker.AddCompleted(params.resumeSeed.Completed)
+		tracker.AddFailed(params.resumeSeed.Failed)
+	} else {
+		tracker.AddFailed(modelMap.RejectedCount)
+	}
 
 	sourceCfg := PlanFileSourceConfig{
 		InputFile:          inputFile,
@@ -119,6 +127,18 @@ func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionPar
 		// Stable request IDs so dispatched IDs match the activation entry
 		// set across retries.
 		BatchID: params.jobInfo.JobID,
+	}
+	if params.resumeSeed != nil {
+		// Skip entries whose results a previous incarnation already
+		// checkpointed; only unfinished work is re-dispatched.
+		terminal := make(map[string]struct{}, len(params.resumeSeed.TerminalRequestIDs))
+		for _, id := range params.resumeSeed.TerminalRequestIDs {
+			terminal[id] = struct{}{}
+		}
+		sourceCfg.Skip = func(requestID string) bool {
+			_, ok := terminal[requestID]
+			return ok
+		}
 	}
 	source := NewPlanFileSource(sourceCfg)
 

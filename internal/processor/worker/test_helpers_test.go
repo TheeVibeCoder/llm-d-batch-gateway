@@ -349,6 +349,10 @@ func (f *failOnStatusDB) Close() error { return f.inner.Close() }
 // ---------------------------------------------------------------------------
 
 func mustNewProcessor(t *testing.T, cfg *config.ProcessorConfig, clients *clientset.Clientset) *Processor {
+	return mustNewProcessorWithID(t, cfg, clients, "test-processor")
+}
+
+func mustNewProcessorWithID(t *testing.T, cfg *config.ProcessorConfig, clients *clientset.Clientset, processorID string) *Processor {
 	t.Helper()
 	if clients.BatchProgressDB == nil {
 		if batchDB, ok := clients.BatchDB.(db.BatchProgressDBClient); ok {
@@ -364,7 +368,7 @@ func mustNewProcessor(t *testing.T, cfg *config.ProcessorConfig, clients *client
 	if clients.File == nil {
 		clients.File = mockfiles.NewMockBatchFilesClient(t.TempDir())
 	}
-	p, err := NewProcessor(cfg, clients, "test-processor", testLogger(t))
+	p, err := NewProcessor(cfg, clients, processorID, testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
 	}

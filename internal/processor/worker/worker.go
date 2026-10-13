@@ -281,13 +281,9 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 
 		// check queue for available tasks
 		logger.V(logging.DEBUG).Info("Checking queue for available tasks")
-		// The resumable lease rides the dequeue: only durable (async) processors
-		// offer one, so a sync-mode processor never claims a requeued resumable row.
-		var resumableLease time.Duration
-		if p.executeDurable() {
-			resumableLease = p.cfg.Resumable.LeaseDuration
-		}
-		task, err := p.poller.dequeueOne(pollingCtx, resumableLease)
+		// The resumable lease rides the dequeue: every processor offers one,
+		// so any replica can claim a requeued resumable row.
+		task, err := p.poller.dequeueOne(pollingCtx, p.cfg.Resumable.LeaseDuration)
 
 		// when there's no waiting tasks in the queue or poller returned an error
 		if task == nil || err != nil {
@@ -359,53 +355,46 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 		// A requeued resumable row is claimed mid-flight (non-terminal, typically
 		// in_progress): the fresh-row expiry and runnable checks do not apply,
 		// and the resume path in runJob owns the terminal routing (cancelling,
-		// SLO-expired, recovery attempts exhausted). A processor without the
-		// durable pipeline cannot resume — the dequeue only offers a lease on
-		// such processors, so this guard is defense in depth.
-		if task.Resumable {
-			if !p.executeDurable() || p.resumable == nil {
-				pollLogger.Error(fmt.Errorf("resumable job claimed by a processor without the durable pipeline"), "Skipping job")
-				p.releaseForNextPoll()
-				metrics.RecordJobProcessed(metrics.ResultSkipped, metrics.ReasonNotRunnableState)
-				continue
-			}
-		} else if batch_utils.IsJobExpired(task) {
-			pollLogger.V(logging.INFO).Info("Job is expired.")
+		// SLO-expired, recovery attempts exhausted).
+		if !task.Resumable {
+			if batch_utils.IsJobExpired(task) {
+				pollLogger.V(logging.INFO).Info("Job is expired.")
 
-			if err := p.updater.UpdatePersistentStatus(pollCtx, jobItem, openai.BatchStatusExpired, nil, nil); err != nil {
-				pollLogger.Error(err, "Failed to update job status in DB", "newStatus", openai.BatchStatusExpired, "slo", task.SLO)
-				recordE2ELatency(jobInfo, metrics.E2EStatusFailed)
-				p.releaseForNextPoll()
-				metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-				continue
-			}
-
-			p.releaseForNextPoll()
-			recordE2ELatency(jobInfo, metrics.E2EStatusExpired)
-			metrics.RecordJobProcessed(metrics.ResultExpired, metrics.ReasonExpiredDequeue)
-			continue
-		} else if !batch_utils.IsJobRunnable(jobInfo.BatchJob) {
-			if jobInfo.BatchJob.Status == openai.BatchStatusCancelling {
-				pollLogger.V(logging.INFO).Info("Job is in cancelling state after dequeue, transitioning to cancelled")
-				if err := p.updater.UpdateCancelledStatus(pollCtx, jobItem, nil, "", ""); err != nil {
-					pollLogger.Error(err, "Failed to update job status to cancelled")
+				if err := p.updater.UpdatePersistentStatus(pollCtx, jobItem, openai.BatchStatusExpired, nil, nil); err != nil {
+					pollLogger.Error(err, "Failed to update job status in DB", "newStatus", openai.BatchStatusExpired, "slo", task.SLO)
 					recordE2ELatency(jobInfo, metrics.E2EStatusFailed)
 					p.releaseForNextPoll()
 					metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
 					continue
 				}
+
 				p.releaseForNextPoll()
-				recordE2ELatency(jobInfo, metrics.E2EStatusCancelled)
-				metrics.RecordCancellation(metrics.CancelPhaseQueued)
-				metrics.RecordJobProcessed(metrics.ResultSuccess, metrics.ReasonNone)
+				recordE2ELatency(jobInfo, metrics.E2EStatusExpired)
+				metrics.RecordJobProcessed(metrics.ResultExpired, metrics.ReasonExpiredDequeue)
+				continue
+			} else if !batch_utils.IsJobRunnable(jobInfo.BatchJob) {
+				if jobInfo.BatchJob.Status == openai.BatchStatusCancelling {
+					pollLogger.V(logging.INFO).Info("Job is in cancelling state after dequeue, transitioning to cancelled")
+					if err := p.updater.UpdateCancelledStatus(pollCtx, jobItem, nil, "", ""); err != nil {
+						pollLogger.Error(err, "Failed to update job status to cancelled")
+						recordE2ELatency(jobInfo, metrics.E2EStatusFailed)
+						p.releaseForNextPoll()
+						metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
+						continue
+					}
+					p.releaseForNextPoll()
+					recordE2ELatency(jobInfo, metrics.E2EStatusCancelled)
+					metrics.RecordCancellation(metrics.CancelPhaseQueued)
+					metrics.RecordJobProcessed(metrics.ResultSuccess, metrics.ReasonNone)
+					continue
+				}
+
+				pollLogger.V(logging.INFO).Info("job is not in processible state. skipping this job.", "status", jobInfo.BatchJob.Status)
+
+				p.releaseForNextPoll()
+				metrics.RecordJobProcessed(metrics.ResultSkipped, metrics.ReasonNotRunnableState)
 				continue
 			}
-
-			pollLogger.V(logging.INFO).Info("job is not in processible state. skipping this job.", "status", jobInfo.BatchJob.Status)
-
-			p.releaseForNextPoll()
-			metrics.RecordJobProcessed(metrics.ResultSkipped, metrics.ReasonNotRunnableState)
-			continue
 		}
 
 		// Guard: if pollingCtx was cancelled between dequeue and here

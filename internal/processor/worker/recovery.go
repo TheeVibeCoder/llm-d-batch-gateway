@@ -48,8 +48,6 @@ const (
 	recoveryUnknownStatus openai.BatchStatus = "unknown"
 )
 
-var errResumableRecoveryUnavailable = errors.New("resumable recovery is not enabled")
-
 // recoveryResult carries the outcome of a recover* function back to recoverJob
 // so that cleanup, metrics, and fallback logic are handled in a single place.
 type recoveryResult struct {
@@ -68,6 +66,11 @@ type recoveryResult struct {
 // The claim bumps the fencing epoch and the recovery attempt counter of each
 // job in one atomic UPDATE. recoverJob re-reads the row afterwards, so recovery
 // writes at the new epoch and a zombie holding the previous one is fenced out.
+//
+// Resumable rows are handed back to the queue (recoverResumableOwned) instead
+// of recovered in place: the polling loop's unified dequeue re-claims them
+// with a fresh lease and routes them through the same resume path a
+// reconciler requeue converges on.
 //
 // Runs once at startup before the polling loop.
 func (p *Processor) recoverOwnedJobs(ctx context.Context) error {
@@ -92,20 +95,21 @@ func (p *Processor) recoverOwnedJobs(ctx context.Context) error {
 		grp.Go(func() error {
 			jlogger := logger.WithValues("jobId", task.ID, "recoveryAttempts", task.RecoveryAttempts)
 			jctx := logr.NewContext(ctx, jlogger)
+			if task.Resumable {
+				if err := p.recoverResumableOwned(jctx, task); err != nil {
+					jlogger.Error(err, "Startup recovery: failed to hand resumable job to the polling loop")
+					return err
+				}
+				return nil
+			}
 			if task.RecoveryAttempts > maxRecoveryAttempts {
 				if failErr := p.recoverExhausted(jctx, task.ID); failErr != nil {
 					jlogger.Error(failErr, "Startup recovery: failed to fail job past its recovery budget")
-					if task.Resumable || errors.Is(failErr, errResumableRecoveryUnavailable) {
-						return failErr
-					}
 				}
 				return nil
 			}
 			if recoverErr := p.recoverJob(jctx, task.ID); recoverErr != nil {
 				jlogger.Error(recoverErr, "Startup recovery: failed to recover owned job")
-				if task.Resumable || errors.Is(recoverErr, errResumableRecoveryUnavailable) {
-					return recoverErr
-				}
 			}
 			return nil
 		})
@@ -120,6 +124,33 @@ func (p *Processor) recoverOwnedJobs(ctx context.Context) error {
 // it is failed with whatever partial results survived.
 const maxRecoveryAttempts = 3
 
+// recoverResumableOwned handles a resumable row claimed at startup. A
+// processor without the durable pipeline keeps the fail-closed behavior (a
+// mixed sync/resumable topology is unsupported). A durable processor hands
+// the row back through the queue: the polling loop's unified dequeue
+// re-claims it with a fresh lease and routes it through the resume path,
+// which owns every terminal decision — recovery budget included.
+func (p *Processor) recoverResumableOwned(ctx context.Context, task *db.BatchJobPriority) error {
+	logger := logr.FromContextOrDiscard(ctx)
+
+	dbItem, err := p.poller.fetchJobItemByID(ctx, task.ID)
+	if err != nil {
+		return err
+	}
+	if dbItem == nil {
+		logger.Info("Startup recovery: resumable job not found in DB, cleaning up stale directory")
+		metrics.RecordStartupRecovery(string(recoveryUnknownStatus), recoveryActionCleanedUp)
+		p.cleanupStaleJobDir(ctx, task.ID)
+		return nil
+	}
+	if err := p.resumable.RequeueResumableOrphan(ctx, task.ID, dbItem.ProcessorID, dbItem.Epoch, false); err != nil {
+		return fmt.Errorf("requeue resumable job: %w", err)
+	}
+	metrics.RecordStartupRecovery(string(p.getJobStatus(dbItem)), recoveryActionReEnqueue)
+	logger.V(logging.INFO).Info("Startup recovery: requeued resumable job for the polling loop")
+	return nil
+}
+
 // recoverExhausted fails a job whose recovery budget is spent.
 func (p *Processor) recoverExhausted(ctx context.Context, jobID string) error {
 	dbItem, err := p.poller.fetchJobItemByID(ctx, jobID)
@@ -128,9 +159,6 @@ func (p *Processor) recoverExhausted(ctx context.Context, jobID string) error {
 	}
 	if dbItem == nil {
 		return nil
-	}
-	if dbItem.Resumable {
-		return fmt.Errorf("%w: recovery attempts exhausted after %d for job %s", errResumableRecoveryUnavailable, maxRecoveryAttempts, jobID)
 	}
 	jobInfo, _ := batch_utils.FromDBItemToJobInfoObject(dbItem)
 	logr.FromContextOrDiscard(ctx).Info("Startup recovery: recovery budget exhausted, failing job")
@@ -171,12 +199,6 @@ func (p *Processor) recoverJobOnce(ctx context.Context, jobID string) error {
 		metrics.RecordStartupRecovery(string(recoveryUnknownStatus), recoveryActionCleanedUp)
 		p.cleanupStaleJobDir(ctx, jobID)
 		return nil
-	}
-	// The resumable writer and durable-manifest recovery path are introduced in
-	// later stages. Until then, fail closed rather than applying legacy recovery
-	// actions that may reset or terminalize resumable work.
-	if dbItem.Resumable {
-		return fmt.Errorf("%w for job %s", errResumableRecoveryUnavailable, jobID)
 	}
 
 	jobInfo, err := batch_utils.FromDBItemToJobInfoObject(dbItem)
@@ -295,6 +317,162 @@ func (p *Processor) recoverExpired(ctx context.Context, dbItem *db.BatchItem, jo
 		statusLabel: statusLabel,
 		counts:      counts,
 	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Resumable pickup
+//
+// A requeued resumable task converges on runJob from two entry points: the
+// unified dequeue (GC-reconciler requeues) and the startup requeue
+// (recoverResumableOwned). The pickup routing owns every terminal decision;
+// everything else resumes through the normal durable pipeline.
+// ---------------------------------------------------------------------------
+
+// routeResumedPickup applies the terminal-bound routing for a requeued
+// resumable task before any execution: a cancelling row finalizes as
+// cancelled, a row past its SLO as expired, and a row past its recovery
+// budget as failed — each with partial artifacts (non-terminal entries
+// become not-executed error lines). It returns true when the job was
+// terminalized (or the attempt failed and the row was left for the
+// reconciler); false means execution should resume.
+func (p *Processor) routeResumedPickup(ctx context.Context, params *jobExecutionParams) bool {
+	logger := logr.FromContextOrDiscard(ctx)
+
+	var status openai.BatchStatus
+	var notExecutedCode batch_types.BatchErrorCode
+	switch {
+	case p.getJobStatus(params.jobItem) == openai.BatchStatusCancelling:
+		status, notExecutedCode = openai.BatchStatusCancelled, batch_types.ErrCodeBatchCancelled
+	case batch_utils.IsJobExpired(params.task):
+		status, notExecutedCode = openai.BatchStatusExpired, batch_types.ErrCodeBatchExpired
+	case params.jobItem.RecoveryAttempts > maxRecoveryAttempts:
+		status, notExecutedCode = openai.BatchStatusFailed, batch_types.ErrCodeBatchFailed
+	default:
+		return false
+	}
+
+	logger.V(logging.INFO).Info("Resumable pickup routed to terminal finalization", "status", status)
+	err := p.finalizeResumableAs(ctx, params.updater, params.jobItem, params.jobInfo, status, notExecutedCode)
+
+	// Cleanup after the terminal write: if it failed, the local files survive
+	// for the reconciler requeue to retry the pickup.
+	cleanupCtx := context.WithoutCancel(ctx)
+	if err == nil || errors.Is(err, errFinalizeFailedOver) {
+		p.cleanupJobArtifacts(cleanupCtx, params.jobItem.ID, params.jobItem.TenantID)
+	}
+	if err != nil {
+		if errors.Is(err, errFinalizeFailedOver) {
+			// The fallback already wrote failed with whatever artifacts
+			// assembled before the failure.
+			recordE2ELatency(params.jobInfo, metrics.E2EStatusFailed)
+			metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
+			return true
+		}
+		logger.Error(err, "Failed to terminalize resumable pickup; leaving the job for the reconciler")
+		return true
+	}
+
+	switch status {
+	case openai.BatchStatusCancelled:
+		recordE2ELatency(params.jobInfo, metrics.E2EStatusCancelled)
+		metrics.RecordCancellation(metrics.CancelPhaseInProgress)
+		metrics.RecordJobProcessed(metrics.ResultSuccess, metrics.ReasonNone)
+	case openai.BatchStatusExpired:
+		recordE2ELatency(params.jobInfo, metrics.E2EStatusExpired)
+		metrics.RecordJobProcessed(metrics.ResultExpired, metrics.ReasonExpiredExecution)
+	default:
+		recordE2ELatency(params.jobInfo, metrics.E2EStatusFailed)
+		metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
+	}
+	return true
+}
+
+// recoverResumable rebuilds the durable execution state of a requeued batch:
+// it verifies the persisted entry set still matches the manifest re-derived
+// from the immutable input file, then returns a result sink at the claimed
+// epoch plus the resume seed (checkpointed counts and terminal request IDs)
+// for the progress tracker and the source skip set. The resumed execution
+// flows through the normal pipeline.
+func (p *Processor) recoverResumable(
+	ctx context.Context,
+	params *jobExecutionParams,
+	manifest *requestManifest,
+) (*batchResultStore, *db.ResumableResumeState, error) {
+	entries, err := p.listResumableEntries(ctx, params.jobItem.ID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list batch entries: %w", err)
+	}
+	if err := checkManifestIntegrity(manifest, entries); err != nil {
+		return nil, nil, fmt.Errorf("batch entry set diverged from the input file: %w", err)
+	}
+
+	seed := &db.ResumableResumeState{}
+	for _, e := range entries {
+		switch e.Status {
+		case db.ResumableEntryCompleted:
+			seed.Completed++
+			seed.TerminalRequestIDs = append(seed.TerminalRequestIDs, e.RequestID)
+		case db.ResumableEntryFailed:
+			seed.Failed++
+			seed.TerminalRequestIDs = append(seed.TerminalRequestIDs, e.RequestID)
+		case db.ResumableEntryInFlight:
+			seed.InFlight++
+		default:
+			seed.Pending++
+		}
+	}
+
+	sink, err := newBatchResultStore(p.files.storage, p.resumable, params.jobItem.ID, params.jobInfo.TenantID, p.processorID, params.jobItem.Epoch)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sink, seed, nil
+}
+
+// checkManifestIntegrity verifies that the persisted entry set matches the
+// manifest re-derived from the immutable input file: same length, and each
+// entry's identity triple (request ID, ordinal, custom ID) equal at its
+// index. An activation-rejected entry must appear as failed with zero
+// attempts — rejected entries are inserted directly as failed while only
+// MarkEntryInFlight increments attempts — so allowlist drift between
+// incarnations is caught in both directions.
+func checkManifestIntegrity(manifest *requestManifest, entries []*db.ResumableEntry) error {
+	if len(entries) != len(manifest.Entries) {
+		return fmt.Errorf("entry set has %d entries, manifest has %d", len(entries), len(manifest.Entries))
+	}
+	for i, e := range entries {
+		m := manifest.Entries[i]
+		if e.RequestID != m.RequestID || e.Ordinal != m.Ordinal || e.CustomID != m.CustomID {
+			return fmt.Errorf("entry %d identity mismatch: persisted (%s, %d, %s), manifest (%s, %d, %s)",
+				i, e.RequestID, e.Ordinal, e.CustomID, m.RequestID, m.Ordinal, m.CustomID)
+		}
+		rejected := e.Status == db.ResumableEntryFailed && e.Attempts == 0
+		if rejected != m.Rejected {
+			return fmt.Errorf("entry %d (%s) rejected-set mismatch: persisted %v, manifest %v",
+				i, e.RequestID, rejected, m.Rejected)
+		}
+	}
+	return nil
+}
+
+// listResumableEntries returns the full entry set in ordinal order.
+func (p *Processor) listResumableEntries(ctx context.Context, jobID string) ([]*db.ResumableEntry, error) {
+	var all []*db.ResumableEntry
+	afterOrdinal := int64(-1)
+	for {
+		entries, err := p.resumable.ListBatchEntries(ctx, jobID, afterOrdinal, resumableEntriesPageSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(entries) == 0 {
+			return all, nil
+		}
+		all = append(all, entries...)
+		afterOrdinal = entries[len(entries)-1].Ordinal
+		if len(entries) < resumableEntriesPageSize {
+			return all, nil
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

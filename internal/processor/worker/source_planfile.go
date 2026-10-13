@@ -31,6 +31,7 @@ type PlanFileSource struct {
 	sloDeadline        time.Time
 	tenantID           string
 	batchID            string
+	skip               func(requestID string) bool
 	logger             logr.Logger
 }
 
@@ -50,7 +51,10 @@ type PlanFileSourceConfig struct {
 	// retries. The legacy pipeline leaves it empty and keeps per-run
 	// random IDs.
 	BatchID string
-	Logger  logr.Logger
+	// Skip, when set, drops requests whose request ID is terminal in the
+	// entry store — a resumed batch must not re-dispatch them.
+	Skip   func(requestID string) bool
+	Logger logr.Logger
 }
 
 func NewPlanFileSource(cfg PlanFileSourceConfig) *PlanFileSource {
@@ -64,6 +68,7 @@ func NewPlanFileSource(cfg PlanFileSourceConfig) *PlanFileSource {
 		sloDeadline:        cfg.SLODeadline,
 		tenantID:           cfg.TenantID,
 		batchID:            cfg.BatchID,
+		skip:               cfg.Skip,
 		logger:             cfg.Logger,
 	}
 }
@@ -71,7 +76,9 @@ func NewPlanFileSource(cfg PlanFileSourceConfig) *PlanFileSource {
 // Produce sends one item per plan entry to the channel. It always reads the
 // input line so each item retains the original custom_id: cancel / expire
 // drain still needs that identity in the error file even when inference is
-// skipped. Context cancellation is handled by the dispatcher drain path.
+// skipped. Entries whose request ID is terminal in the entry store are dropped
+// entirely — a resumed batch only dispatches unfinished work. Context
+// cancellation is handled by the dispatcher drain path.
 func (s *PlanFileSource) Produce(_ context.Context, outgoingRequestCh chan<- pipeline.RequestItem) error {
 	defer close(outgoingRequestCh)
 
@@ -86,6 +93,9 @@ func (s *PlanFileSource) Produce(_ context.Context, outgoingRequestCh chan<- pip
 			item, err := s.readEntry(entry, modelID)
 			if err != nil {
 				return err
+			}
+			if s.skip != nil && s.skip(item.RequestID) {
+				continue
 			}
 			outgoingRequestCh <- *item
 		}

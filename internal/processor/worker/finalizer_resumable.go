@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -73,7 +74,7 @@ func (p *Processor) finalizeResumableJob(
 		return fmt.Errorf("failed to update job status to finalizing: %w", err)
 	}
 
-	counts, outputFileID, errorFileID, err := p.assembleResumableArtifacts(ioCtx, dbJob, jobInfo)
+	counts, outputFileID, errorFileID, err := p.assembleResumableArtifacts(ioCtx, dbJob, jobInfo, "")
 	if err != nil {
 		logger.Error(err, "Failed to assemble resumable artifacts")
 		if failErr := updater.UpdateFailedStatus(ioCtx, dbJob, counts, outputFileID, errorFileID); failErr != nil {
@@ -111,15 +112,74 @@ func (p *Processor) finalizeResumableJob(
 	return nil
 }
 
-// assembleResumableArtifacts streams every terminal entry's result object,
-// in input order, into the batch's output and error artifacts and returns
-// the final request counts and file IDs. Each object's size and SHA-256 are
-// verified while streaming. Artifact file IDs are derived from the batch, so
-// a re-finalization targets the same keys.
+// finalizeResumableAs terminalizes a durable batch that must not resume
+// execution — a requeued row that is cancelling, past its SLO, or past its
+// recovery budget. It streams the checkpointed artifacts (non-terminal
+// entries become not-executed error lines) and writes the given terminal
+// status. Cleanup and metrics belong to the caller. A failed terminal write
+// returns the error: the row stays non-terminal and the reconciler requeues
+// it, so the pickup is retried instead of degraded.
+func (p *Processor) finalizeResumableAs(
+	ctx context.Context,
+	updater *StatusUpdater,
+	dbJob *db.BatchItem,
+	jobInfo *batch_types.JobInfo,
+	status openai.BatchStatus,
+	notExecutedCode batch_types.BatchErrorCode,
+) error {
+	logger := logr.FromContextOrDiscard(ctx)
+	logger.V(logging.INFO).Info("Terminalizing resumable job without resuming execution", "status", status)
+
+	ioCtx, ioSpan := uotel.DetachedContext(ctx, "finalize-resumable-as")
+	ioCtx, ioCancel := context.WithTimeout(ioCtx, p.cfg.Resumable.FinalizeTimeout)
+	defer ioCancel()
+	defer ioSpan.End()
+
+	resumable := true
+	dbJob.ExpectedResumable = &resumable
+
+	counts, outputFileID, errorFileID, err := p.assembleResumableArtifacts(ioCtx, dbJob, jobInfo, notExecutedCode)
+	if err != nil {
+		logger.Error(err, "Failed to assemble resumable artifacts")
+		if failErr := updater.UpdateFailedStatus(ioCtx, dbJob, counts, outputFileID, errorFileID); failErr != nil {
+			return fmt.Errorf("artifact assembly failed (%w) and fallback status write also failed: %w", err, failErr)
+		}
+		return fmt.Errorf("assemble resumable artifacts: %w", errFinalizeFailedOver)
+	}
+
+	var writeErr error
+	switch status {
+	case openai.BatchStatusCancelled:
+		writeErr = updater.UpdateCancelledStatus(ioCtx, dbJob, counts, outputFileID, errorFileID)
+	case openai.BatchStatusExpired:
+		writeErr = updater.UpdateExpiredStatus(ioCtx, dbJob, counts, outputFileID, errorFileID)
+	default:
+		writeErr = updater.UpdateFailedStatus(ioCtx, dbJob, counts, outputFileID, errorFileID)
+	}
+	if writeErr != nil {
+		return fmt.Errorf("update job status to %s: %w", status, writeErr)
+	}
+
+	setRequestCountAttrs(ctx, counts)
+	logger.V(logging.INFO).Info("Resumable job terminalized", "status", status,
+		"outputFileID", outputFileID, "errorFileID", errorFileID)
+	return nil
+}
+
+// assembleResumableArtifacts streams every entry's result object, in input
+// order, into the batch's output and error artifacts and returns the final
+// request counts and file IDs. Each object's size and SHA-256 are verified
+// while streaming. Artifact file IDs are derived from the batch, so a
+// re-finalization targets the same keys.
+//
+// notExecutedCode renders non-terminal entries as synthetic not-executed
+// error lines, for terminalizing a batch that must not resume execution; an
+// empty code demands every entry be terminal (the completed path).
 func (p *Processor) assembleResumableArtifacts(
 	ctx context.Context,
 	dbJob *db.BatchItem,
 	jobInfo *batch_types.JobInfo,
+	notExecutedCode batch_types.BatchErrorCode,
 ) (*openai.BatchRequestCounts, string, string, error) {
 	jobID := jobInfo.JobID
 	folder, err := ucom.GetFolderNameByTenantID(jobInfo.TenantID)
@@ -173,9 +233,16 @@ func (p *Processor) assembleResumableArtifacts(
 					w = errorW
 				}
 			default:
-				// Execution cannot succeed with unresolved entries; the
-				// checkpointer resolves everything it drains.
-				return nil, "", "", fmt.Errorf("entry %s is still %s", e.RequestID, e.Status)
+				if notExecutedCode == "" {
+					// Execution cannot succeed with unresolved entries; the
+					// checkpointer resolves everything it drains.
+					return nil, "", "", fmt.Errorf("entry %s is still %s", e.RequestID, e.Status)
+				}
+				counts.Failed++
+				if err := errorW.writeNotExecuted(ctx, e, notExecutedCode); err != nil {
+					return nil, "", "", err
+				}
+				continue
 			}
 			if err := w.streamEntry(ctx, e); err != nil {
 				return nil, "", "", err
@@ -239,6 +306,31 @@ func (w *artifactWriter) streamEntry(ctx context.Context, e *db.ResumableEntry) 
 	}
 	if size != e.ResultBytes || hex.EncodeToString(hasher.Sum(nil)) != e.ResultSHA256 {
 		return fmt.Errorf("result %s failed integrity check: got %d bytes, want %d", e.ResultKey, size, e.ResultBytes)
+	}
+	return nil
+}
+
+// writeNotExecuted renders a non-terminal entry as a synthetic not-executed
+// error line, so a batch terminalized without resuming still produces a
+// complete artifact set.
+func (w *artifactWriter) writeNotExecuted(ctx context.Context, e *db.ResumableEntry, code batch_types.BatchErrorCode) error {
+	if err := w.ensure(ctx); err != nil {
+		return err
+	}
+	lineBytes, err := json.Marshal(&outputLine{
+		ID:       e.RequestID,
+		CustomID: e.CustomID,
+		Error: &outputError{
+			Code:    string(code),
+			Message: code.Message(),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal not-executed line for %s: %w", e.RequestID, err)
+	}
+	lineBytes = append(lineBytes, '\n')
+	if _, err := w.writer.Write(lineBytes); err != nil {
+		return fmt.Errorf("write not-executed line for %s: %w", e.RequestID, err)
 	}
 	return nil
 }

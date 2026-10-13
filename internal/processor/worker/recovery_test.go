@@ -354,7 +354,7 @@ func TestRecoverOwnedJobs(t *testing.T) {
 		}
 	})
 
-	t.Run("resumable job fails closed", func(t *testing.T) {
+	t.Run("resumable job is requeued for the polling loop", func(t *testing.T) {
 		workDir := t.TempDir()
 		p, batchDB, spyQueue := newRecoveryTestProcessorWithQueryFilter(t, workDir)
 
@@ -362,10 +362,11 @@ func TestRecoverOwnedJobs(t *testing.T) {
 		seedResumableDBJobWithStatus(t, batchDB, id, "tenant-1", openai.BatchStatusInProgress, nil)
 		setProcessorID(t, batchDB, id, p.processorID)
 
-		err := p.recoverOwnedJobs(testLoggerCtx(t))
-		if err == nil {
-			t.Fatal("expected resumable recovery to fail closed")
+		if err := p.recoverOwnedJobs(testLoggerCtx(t)); err != nil {
+			t.Fatalf("recoverOwnedJobs: %v", err)
 		}
+		// The resumable row is handed back through the fenced requeue, not
+		// the priority queue, and stays non-terminal for the dequeue to claim.
 		if spyQueue.EnqueueCalls() != 0 {
 			t.Fatalf("resumable job was re-enqueued %d times", spyQueue.EnqueueCalls())
 		}
@@ -374,7 +375,7 @@ func TestRecoverOwnedJobs(t *testing.T) {
 		}
 	})
 
-	t.Run("resumable failure does not prevent legacy recovery", func(t *testing.T) {
+	t.Run("resumable requeue does not prevent legacy recovery", func(t *testing.T) {
 		workDir := t.TempDir()
 		p, batchDB, spyQueue := newRecoveryTestProcessorWithQueryFilter(t, workDir)
 
@@ -385,9 +386,8 @@ func TestRecoverOwnedJobs(t *testing.T) {
 			createJobDir(t, p, id, "tenant-1")
 		}
 
-		err := p.recoverOwnedJobs(testLoggerCtx(t))
-		if !errors.Is(err, errResumableRecoveryUnavailable) {
-			t.Fatalf("expected resumable recovery error, got %v", err)
+		if err := p.recoverOwnedJobs(testLoggerCtx(t)); err != nil {
+			t.Fatalf("recoverOwnedJobs: %v", err)
 		}
 		if spyQueue.EnqueueCalls() != 1 {
 			t.Fatalf("legacy job was not recovered exactly once: %d enqueue calls", spyQueue.EnqueueCalls())
