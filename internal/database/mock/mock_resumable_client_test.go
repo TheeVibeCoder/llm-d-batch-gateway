@@ -159,6 +159,105 @@ func TestMockResumableStore_Lease(t *testing.T) {
 	})
 }
 
+func TestMockResumableStore_Finalize(t *testing.T) {
+	ctx := context.Background()
+	doc := []byte(`{"status":"completed","request_counts":{"total":2,"completed":2}}`)
+
+	finOf := func(expected string) *api.ResumableFinalization {
+		return &api.ResumableFinalization{
+			BatchID: "job-1", ProcessorID: "proc-1", Epoch: activationEpoch,
+			ExpectedStatus: expected, Status: doc,
+		}
+	}
+
+	t.Run("persists the terminal status and releases ownership", func(t *testing.T) {
+		store, _ := seedActivated(t)
+		if err := store.FinalizeResumableBatch(ctx, finOf("in_progress")); err != nil {
+			t.Fatalf("FinalizeResumableBatch: %v", err)
+		}
+		// The released owner fences out of every subsequent write.
+		if _, err := store.MarkEntryInFlight(ctx, "job-1", "r-1", "proc-1", activationEpoch); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("entry write after finalize: expected ErrConflict, got %v", err)
+		}
+		if err := store.RenewResumableBatchLease(ctx, "job-1", "proc-1", activationEpoch, activationLeaseTTL); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("renew after finalize: expected ErrConflict, got %v", err)
+		}
+	})
+
+	t.Run("fenced transitions conflict", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			mutate func(store *MockResumableStore, clock *frozenClock)
+			fin    *api.ResumableFinalization
+		}{
+			{name: "expected status does not match the row",
+				fin: finOf("finalizing")},
+			{name: "stale epoch",
+				fin: func() *api.ResumableFinalization {
+					f := finOf("in_progress")
+					f.Epoch = activationEpoch + 1
+					return f
+				}()},
+			{name: "foreign owner",
+				fin: func() *api.ResumableFinalization {
+					f := finOf("in_progress")
+					f.ProcessorID = "proc-other"
+					return f
+				}()},
+			{name: "lapsed lease",
+				mutate: func(_ *MockResumableStore, clock *frozenClock) {
+					clock.Advance(activationLeaseTTL + time.Minute)
+				},
+				fin: finOf("in_progress")},
+			{name: "requeued batch lost its owner",
+				mutate: func(store *MockResumableStore, _ *frozenClock) {
+					_ = store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, false)
+				},
+				fin: finOf("in_progress")},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				store, clock := seedActivated(t)
+				if tt.mutate != nil {
+					tt.mutate(store, clock)
+				}
+				if err := store.FinalizeResumableBatch(ctx, tt.fin); !errors.Is(err, api.ErrConflict) {
+					t.Fatalf("expected ErrConflict, got %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("retry with the identical status document is idempotent", func(t *testing.T) {
+		store, _ := seedActivated(t)
+		if err := store.FinalizeResumableBatch(ctx, finOf("in_progress")); err != nil {
+			t.Fatalf("first finalize: %v", err)
+		}
+		if err := store.FinalizeResumableBatch(ctx, finOf("in_progress")); err != nil {
+			t.Fatalf("identical retry: %v", err)
+		}
+		// A different document over the committed terminal state conflicts.
+		other := finOf("in_progress")
+		other.Status = []byte(`{"status":"cancelled"}`)
+		if err := store.FinalizeResumableBatch(ctx, other); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("diverging retry: expected ErrConflict, got %v", err)
+		}
+	})
+
+	t.Run("validates input", func(t *testing.T) {
+		store, _ := seedActivated(t)
+		for _, fin := range []*api.ResumableFinalization{
+			nil,
+			{BatchID: "job-1", ProcessorID: "proc-1", Epoch: activationEpoch, ExpectedStatus: "in_progress"},
+			{BatchID: "job-1", ProcessorID: "proc-1", Epoch: activationEpoch, Status: doc},
+		} {
+			if err := store.FinalizeResumableBatch(ctx, fin); err == nil {
+				t.Fatalf("finalization %+v: expected validation error, got nil", fin)
+			}
+		}
+	})
+}
+
 func TestMockResumableStore_Requeue(t *testing.T) {
 	ctx := context.Background()
 

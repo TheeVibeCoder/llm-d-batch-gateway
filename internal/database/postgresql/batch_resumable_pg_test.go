@@ -18,8 +18,11 @@ package postgresql
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -393,6 +396,170 @@ func TestRequeueResumableOrphanPG(t *testing.T) {
 		}
 		if s := readRow(t, id); s.processor == nil || *s.processor != testProcessorID {
 			t.Fatal("non-resumable row must not be touched")
+		}
+	})
+}
+
+func TestFinalizeResumableBatchPG(t *testing.T) {
+	env := newResumablePgEnv(t)
+	doc := []byte(`{"status":"completed","request_counts":{"total":3,"completed":3}}`)
+
+	// setBatchStatus rewrites the row's status name, staging the transitions
+	// the row store performs (in_progress → finalizing, the cancel CAS, …).
+	setBatchStatus := func(t *testing.T, id, status string) {
+		t.Helper()
+		if _, err := env.pool.Exec(env.ctx,
+			`UPDATE batch_items SET status = jsonb_set(status, '{status}', $2::jsonb) WHERE id = $1`,
+			id, `"`+status+`"`,
+		); err != nil {
+			t.Fatalf("set status %s: %v", status, err)
+		}
+	}
+
+	t.Run("persists the terminal status and releases ownership", func(t *testing.T) {
+		const id = "batch-fin"
+		epoch := env.activate(t, id)
+
+		if err := env.store.FinalizeResumableBatch(env.ctx, &api.ResumableFinalization{
+			BatchID: id, ProcessorID: testProcessorID, Epoch: epoch,
+			ExpectedStatus: "in_progress", Status: doc,
+		}); err != nil {
+			t.Fatalf("FinalizeResumableBatch: %v", err)
+		}
+
+		var status []byte
+		var resumable bool
+		var processor *string
+		var lease *time.Time
+		if err := env.pool.QueryRow(env.ctx,
+			`SELECT status, resumable, processor_id, owner_lease_expires_at
+			 FROM batch_items WHERE id = $1`, id,
+		).Scan(&status, &resumable, &processor, &lease); err != nil {
+			t.Fatalf("read row: %v", err)
+		}
+		// jsonb canonicalizes the document, so compare semantically.
+		var got, want any
+		if err := json.Unmarshal(status, &got); err != nil {
+			t.Fatalf("stored status is not JSON: %v", err)
+		}
+		if err := json.Unmarshal(doc, &want); err != nil {
+			t.Fatalf("test document is not JSON: %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("status = %s, want the terminal document %s", status, doc)
+		}
+		if resumable || lease != nil || processor == nil || *processor != testProcessorID {
+			t.Fatalf("ownership not released: resumable=%v processor=%v lease=%v", resumable, processor, lease)
+		}
+		// The released owner fences out of entry writes.
+		if _, err := env.store.MarkEntryInFlight(env.ctx, id, "batch_req_a", testProcessorID, epoch); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("entry write after finalize: expected ErrConflict, got %v", err)
+		}
+	})
+
+	t.Run("transition table over source statuses", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			source   string // row status before the finalization
+			expected string // expected status the finalizer passes
+			wantErr  bool
+		}{
+			{name: "in_progress", source: "in_progress", expected: "in_progress"},
+			{name: "finalizing", source: "finalizing", expected: "finalizing"},
+			{name: "cancelling", source: "cancelling", expected: "cancelling"},
+			{name: "cancel raced the finalizer", source: "cancelling", expected: "finalizing", wantErr: true},
+			{name: "finalizer believes a stale status", source: "finalizing", expected: "in_progress", wantErr: true},
+			{name: "already terminal", source: "completed", expected: "finalizing", wantErr: true},
+		}
+		for i, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				id := fmt.Sprintf("batch-fin-table-%d", i)
+				epoch := env.activate(t, id)
+				setBatchStatus(t, id, tt.source)
+
+				err := env.store.FinalizeResumableBatch(env.ctx, &api.ResumableFinalization{
+					BatchID: id, ProcessorID: testProcessorID, Epoch: epoch,
+					ExpectedStatus: tt.expected, Status: doc,
+				})
+				if tt.wantErr && !errors.Is(err, api.ErrConflict) {
+					t.Fatalf("expected ErrConflict, got %v", err)
+				}
+				if !tt.wantErr && err != nil {
+					t.Fatalf("FinalizeResumableBatch: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("fenced out by stale epoch, foreign owner, and lapsed lease", func(t *testing.T) {
+		const id = "batch-fin-fence"
+		epoch := env.activate(t, id)
+
+		fin := &api.ResumableFinalization{
+			BatchID: id, ProcessorID: testProcessorID, Epoch: epoch,
+			ExpectedStatus: "in_progress", Status: doc,
+		}
+		stale := *fin
+		stale.Epoch = epoch + 1
+		if err := env.store.FinalizeResumableBatch(env.ctx, &stale); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("stale epoch: expected ErrConflict, got %v", err)
+		}
+		foreign := *fin
+		foreign.ProcessorID = "proc-other"
+		if err := env.store.FinalizeResumableBatch(env.ctx, &foreign); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("foreign owner: expected ErrConflict, got %v", err)
+		}
+		env.expireLease(t, id)
+		if err := env.store.FinalizeResumableBatch(env.ctx, fin); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("lapsed lease: expected ErrConflict, got %v", err)
+		}
+	})
+
+	t.Run("requeued zombie cannot finalize", func(t *testing.T) {
+		const id = "batch-fin-zombie"
+		epoch := env.activate(t, id)
+		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, false); err != nil {
+			t.Fatalf("RequeueResumableOrphan: %v", err)
+		}
+
+		err := env.store.FinalizeResumableBatch(env.ctx, &api.ResumableFinalization{
+			BatchID: id, ProcessorID: testProcessorID, Epoch: epoch,
+			ExpectedStatus: "in_progress", Status: doc,
+		})
+		if !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("zombie finalize: expected ErrConflict, got %v", err)
+		}
+		var status string
+		if err := env.pool.QueryRow(env.ctx,
+			`SELECT status->>'status' FROM batch_items WHERE id = $1`, id,
+		).Scan(&status); err != nil {
+			t.Fatalf("read row: %v", err)
+		}
+		if status != "in_progress" {
+			t.Fatalf("zombie must not touch the row, status = %s", status)
+		}
+	})
+
+	t.Run("retry with the identical status document is idempotent", func(t *testing.T) {
+		const id = "batch-fin-idempotent"
+		epoch := env.activate(t, id)
+
+		fin := &api.ResumableFinalization{
+			BatchID: id, ProcessorID: testProcessorID, Epoch: epoch,
+			ExpectedStatus: "in_progress", Status: doc,
+		}
+		if err := env.store.FinalizeResumableBatch(env.ctx, fin); err != nil {
+			t.Fatalf("first finalize: %v", err)
+		}
+		// The retry re-sends the same document after an ambiguous response.
+		if err := env.store.FinalizeResumableBatch(env.ctx, fin); err != nil {
+			t.Fatalf("identical retry: %v", err)
+		}
+		// A diverging document over the committed terminal state conflicts.
+		diverging := *fin
+		diverging.Status = []byte(`{"status":"cancelled"}`)
+		if err := env.store.FinalizeResumableBatch(env.ctx, &diverging); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("diverging retry: expected ErrConflict, got %v", err)
 		}
 	})
 }

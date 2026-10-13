@@ -20,7 +20,9 @@ package mock
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -41,6 +43,8 @@ type mockResumableBatch struct {
 	terminal         bool
 	leaseExpiresAt   time.Time
 	entries          []*api.ResumableEntry // ordered by ordinal
+	statusName       string                // current status name, for expected-status fences
+	statusDoc        []byte                // persisted terminal status document
 }
 
 // MockResumableStore is a stateful in-memory api.ResumableStore. Writes are
@@ -99,6 +103,16 @@ func (m *MockResumableStore) BatchOwnership(batchID string) (processorID string,
 	return b.processorID, b.epoch, b.recoveryAttempts
 }
 
+// SetBatchStatus overrides a seeded batch's status name, staging transitions
+// the row store performs outside this mock (e.g. in_progress → finalizing).
+func (m *MockResumableStore) SetBatchStatus(batchID, statusName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if b, ok := m.batches[batchID]; ok {
+		b.statusName = statusName
+	}
+}
+
 func (m *MockResumableStore) Close() error {
 	return nil
 }
@@ -148,6 +162,7 @@ func (m *MockResumableStore) ActivateResumableBatch(ctx context.Context, activat
 
 	b.resumable = true
 	b.leaseExpiresAt = m.now().Add(activation.LeaseTTL)
+	b.statusName = "in_progress"
 	return nil
 }
 
@@ -166,6 +181,51 @@ func (m *MockResumableStore) RenewResumableBatchLease(ctx context.Context, batch
 	}
 	b.leaseExpiresAt = m.now().Add(ttl)
 	return nil
+}
+
+func (m *MockResumableStore) FinalizeResumableBatch(ctx context.Context, fin *api.ResumableFinalization) error {
+	if fin == nil {
+		return fmt.Errorf("FinalizeResumableBatch: nil finalization")
+	}
+	if fin.BatchID == "" || fin.ProcessorID == "" {
+		return fmt.Errorf("FinalizeResumableBatch: batch ID and processor ID are required")
+	}
+	if fin.ExpectedStatus == "" || len(fin.Status) == 0 {
+		return fmt.Errorf("FinalizeResumableBatch: expected and target status are required")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	b, ok := m.batches[fin.BatchID]
+	if ok && m.ownedFence(b, fin.ProcessorID, fin.Epoch) && b.statusName == fin.ExpectedStatus {
+		b.statusDoc = fin.Status
+		b.terminal = true
+		b.resumable = false
+		b.leaseExpiresAt = time.Time{}
+		return nil
+	}
+	// Zero rows: the fence failed, or an earlier attempt committed the
+	// identical status document (ambiguous response). The comparison is
+	// semantic, mirroring the jsonb canonicalization of the row store.
+	if ok && b.terminal && jsonEqual(b.statusDoc, fin.Status) {
+		return nil
+	}
+	return fmt.Errorf("FinalizeResumableBatch: %s is not owned by %s at epoch %d in status %q: %w",
+		fin.BatchID, fin.ProcessorID, fin.Epoch, fin.ExpectedStatus, api.ErrConflict)
+}
+
+// jsonEqual reports whether two JSON documents hold the same value,
+// ignoring key order and whitespace.
+func jsonEqual(a, b []byte) bool {
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(av, bv)
 }
 
 func (m *MockResumableStore) RequeueResumableOrphan(ctx context.Context, batchID, processorID string, epoch int64, requireExpiredLease bool) error {

@@ -157,6 +157,10 @@ func (c *errStoreFileClient) Delete(ctx context.Context, fileName, folderName st
 	return nil
 }
 
+func (c *errStoreFileClient) DeletePrefix(ctx context.Context, folderName, prefix string) (int, error) {
+	return 0, nil
+}
+
 func (c *errStoreFileClient) OpenStream(ctx context.Context, fileName, folderName string) (fsapi.StreamWriter, error) {
 	return nil, errors.New("not implemented")
 }

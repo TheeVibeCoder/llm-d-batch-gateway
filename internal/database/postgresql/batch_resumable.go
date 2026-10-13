@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -195,6 +196,69 @@ func (c *PostgresResumableStore) RequeueResumableOrphan(ctx context.Context, bat
 	logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("RequeueResumableOrphan: requeued",
 		"batchId", batchID, "epoch", epoch)
 	return nil
+}
+
+// FinalizeResumableBatch performs the fenced terminal transition of an owned,
+// activated batch: it persists the terminal status document and clears
+// resumable/lease (processor_id stays for audit). RowsAffected == 0 means the
+// fence failed or an earlier attempt already committed — a row persisting
+// exactly the given status document is an idempotent success, anything else a
+// conflict.
+func (c *PostgresResumableStore) FinalizeResumableBatch(ctx context.Context, fin *api.ResumableFinalization) error {
+	if fin == nil {
+		return fmt.Errorf("FinalizeResumableBatch: nil finalization")
+	}
+	if fin.BatchID == "" || fin.ProcessorID == "" {
+		return fmt.Errorf("FinalizeResumableBatch: batch ID and processor ID are required")
+	}
+	if fin.ExpectedStatus == "" || len(fin.Status) == 0 {
+		return fmt.Errorf("FinalizeResumableBatch: expected and target status are required")
+	}
+
+	result, err := c.pool.Exec(ctx,
+		`UPDATE batch_items
+		SET status = $5, resumable = FALSE, owner_lease_expires_at = NULL
+		WHERE id = $1 AND processor_id = $2 AND epoch = $3
+		  AND resumable = TRUE AND owner_lease_expires_at > NOW()
+		  AND status::jsonb->>'status' = $4`,
+		fin.BatchID, fin.ProcessorID, fin.Epoch, fin.ExpectedStatus, fin.Status,
+	)
+	if err != nil {
+		return fmt.Errorf("FinalizeResumableBatch: %w", err)
+	}
+	if result.RowsAffected() > 0 {
+		logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("FinalizeResumableBatch: finalized",
+			"batchId", fin.BatchID, "epoch", fin.Epoch)
+		return nil
+	}
+
+	// Zero rows: the fence failed, or an earlier attempt committed the
+	// transition but its response was lost. Only the latter is a success;
+	// jsonb canonicalizes the stored document, so the comparison is
+	// semantic rather than bytewise.
+	var committed []byte
+	if err := c.pool.QueryRow(ctx,
+		`SELECT status FROM batch_items WHERE id = $1`, fin.BatchID,
+	).Scan(&committed); err == nil && jsonEqual(committed, fin.Status) {
+		logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("FinalizeResumableBatch: already finalized",
+			"batchId", fin.BatchID, "epoch", fin.Epoch)
+		return nil
+	}
+	return fmt.Errorf("FinalizeResumableBatch: %s is not owned by %s at epoch %d in status %q: %w",
+		fin.BatchID, fin.ProcessorID, fin.Epoch, fin.ExpectedStatus, api.ErrConflict)
+}
+
+// jsonEqual reports whether two JSON documents hold the same value,
+// ignoring key order and whitespace.
+func jsonEqual(a, b []byte) bool {
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(av, bv)
 }
 
 // MarkEntryInFlight records an imminent submission. It returns false when the

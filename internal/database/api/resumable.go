@@ -121,12 +121,35 @@ type ResumableBatchStore interface {
 	ActivateResumableBatch(ctx context.Context, activation *ResumableActivation) error
 }
 
+// ResumableFinalization is one fenced terminal transition of an activated
+// batch: the terminal status document to persist, fenced on the owning
+// processor and the source status the transition starts from.
+type ResumableFinalization struct {
+	BatchID     string
+	ProcessorID string
+	Epoch       int64
+	// ExpectedStatus is the source status name the transition is fenced on
+	// (e.g. "finalizing" or "cancelling").
+	ExpectedStatus string
+	// Status is the terminal status document to persist.
+	Status []byte
+}
+
 // ResumableBatchLeaseStore manages ownership of an activated batch.
 type ResumableBatchLeaseStore interface {
 	// RenewResumableBatchLease extends the owner's lease, fenced on the
 	// owning processor, epoch, and an unexpired lease. A failed fence (ownership
 	// moved or lease lapsed) returns ErrConflict.
 	RenewResumableBatchLease(ctx context.Context, batchID, processorID string, epoch int64, ttl time.Duration) error
+
+	// FinalizeResumableBatch transitions an owned, activated batch to a
+	// terminal status and releases the lease (resumable/lease cleared;
+	// processor_id stays for audit). The write is fenced on the owning
+	// processor, epoch, an unexpired lease, and the expected source status. A
+	// zero-row update is retried as a verification: a row already persisting
+	// exactly the given status document is an idempotent success (an ambiguous
+	// response from an earlier attempt); anything else returns ErrConflict.
+	FinalizeResumableBatch(ctx context.Context, fin *ResumableFinalization) error
 
 	// RequeueResumableOrphan clears ownership of an orphaned resumable batch
 	// (processor_id = NULL, epoch + 1, recovery_attempts + 1) so it becomes
