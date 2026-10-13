@@ -75,8 +75,10 @@ func TestExecuteJob_SingleModel(t *testing.T) {
 
 	ctx := testLoggerCtx(t)
 	counts, err := env.p.executeJob(ctx, &jobExecutionParams{
-		updater: env.updater,
-		jobInfo: jobInfo,
+		updater:    env.updater,
+		jobInfo:    jobInfo,
+		jobItem:    env.jobItem,
+		resultSink: env.sink,
 	})
 	if err != nil {
 		t.Fatalf("executeJob error: %v", err)
@@ -88,39 +90,15 @@ func TestExecuteJob_SingleModel(t *testing.T) {
 		t.Fatalf("Completed+Failed = %d, want 2", counts.Completed+counts.Failed)
 	}
 
-	outputPath, _ := env.p.jobOutputFilePath(jobInfo.JobID, jobInfo.TenantID)
-	outBytes, err := os.ReadFile(outputPath)
+	// Every request checkpoints exactly one terminal entry — guards against
+	// duplicates and lost results.
+	state, err := env.p.resumable.EntryResumeState(ctx, jobInfo.JobID)
 	if err != nil {
-		t.Fatalf("read output file: %v", err)
+		t.Fatalf("EntryResumeState: %v", err)
 	}
-	outputLines := bytes.Split(bytes.TrimSpace(outBytes), []byte{'\n'})
-	if len(outputLines) != 2 {
-		t.Fatalf("output lines = %d, want 2", len(outputLines))
-	}
-
-	// Verify each custom_id appears exactly once — guards against duplicates.
-	seenIDs := make(map[string]int)
-	for _, line := range outputLines {
-		var entry outputLine
-		if err := json.Unmarshal(line, &entry); err != nil {
-			t.Fatalf("unmarshal output line: %v", err)
-		}
-		seenIDs[entry.CustomID]++
-	}
-	for _, wantID := range []string{"r1", "r2"} {
-		if seenIDs[wantID] != 1 {
-			t.Errorf("custom_id %q appeared %d times, want 1", wantID, seenIDs[wantID])
-		}
-	}
-
-	// Error file should be empty (all requests succeeded).
-	errorPath, _ := env.p.jobErrorFilePath(jobInfo.JobID, jobInfo.TenantID)
-	errBytes, err := os.ReadFile(errorPath)
-	if err != nil && !os.IsNotExist(err) {
-		t.Fatalf("read error file: %v", err)
-	}
-	if len(bytes.TrimSpace(errBytes)) > 0 {
-		t.Fatalf("expected empty error file, got: %s", errBytes)
+	if state.Completed != 2 || state.Failed != 0 || len(state.TerminalRequestIDs) != 2 {
+		t.Fatalf("entry state = completed %d / failed %d / terminal %d, want 2 / 0 / 2",
+			state.Completed, state.Failed, len(state.TerminalRequestIDs))
 	}
 }
 
@@ -200,9 +178,12 @@ func TestConfiguredEndpointReachesInferenceClientUnchanged(t *testing.T) {
 			if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 				t.Fatalf("preProcessJob() error = %v", err)
 			}
+			sink, jobItem := activateJobEntries(t, p, jobID, tenantID, []string{"request-1"})
 			counts, err := p.executeJob(ctx, &jobExecutionParams{
-				updater: NewStatusUpdater(dbClient),
-				jobInfo: jobInfo,
+				updater:    NewStatusUpdater(dbClient),
+				jobInfo:    jobInfo,
+				jobItem:    jobItem,
+				resultSink: sink,
 			})
 			if err != nil {
 				t.Fatalf("executeJob() error = %v", err)
@@ -239,8 +220,10 @@ func TestExecuteJob_MultipleModels(t *testing.T) {
 
 	ctx := testLoggerCtx(t)
 	counts, err := env.p.executeJob(ctx, &jobExecutionParams{
-		updater: env.updater,
-		jobInfo: jobInfo,
+		updater:    env.updater,
+		jobInfo:    jobInfo,
+		jobItem:    env.jobItem,
+		resultSink: env.sink,
 	})
 	if err != nil {
 		t.Fatalf("executeJob error: %v", err)
@@ -252,28 +235,14 @@ func TestExecuteJob_MultipleModels(t *testing.T) {
 		t.Fatalf("inference calls = %d, want 4", callCount.Load())
 	}
 
-	// Verify each custom_id appears exactly once and all 4 are present.
-	outputPath, _ := env.p.jobOutputFilePath(jobInfo.JobID, jobInfo.TenantID)
-	outBytes, err := os.ReadFile(outputPath)
+	// Every request checkpoints exactly one terminal entry.
+	state, err := env.p.resumable.EntryResumeState(ctx, jobInfo.JobID)
 	if err != nil {
-		t.Fatalf("read output file: %v", err)
+		t.Fatalf("EntryResumeState: %v", err)
 	}
-	outputLines := bytes.Split(bytes.TrimSpace(outBytes), []byte{'\n'})
-	if len(outputLines) != 4 {
-		t.Fatalf("output lines = %d, want 4", len(outputLines))
-	}
-	seenIDs := make(map[string]int)
-	for _, line := range outputLines {
-		var entry outputLine
-		if err := json.Unmarshal(line, &entry); err != nil {
-			t.Fatalf("unmarshal output line: %v", err)
-		}
-		seenIDs[entry.CustomID]++
-	}
-	for _, wantID := range []string{"a", "b", "c", "d"} {
-		if seenIDs[wantID] != 1 {
-			t.Errorf("custom_id %q appeared %d times, want 1", wantID, seenIDs[wantID])
-		}
+	if state.Completed != 4 || len(state.TerminalRequestIDs) != 4 {
+		t.Fatalf("entry state = completed %d / terminal %d, want 4 / 4",
+			state.Completed, len(state.TerminalRequestIDs))
 	}
 }
 
@@ -301,6 +270,8 @@ func TestExecuteJob_ContextCancelled(t *testing.T) {
 	_, err := env.p.executeJob(ctx, &jobExecutionParams{
 		updater: env.updater,
 		jobInfo: jobInfo,
+		jobItem:    env.jobItem,
+		resultSink: env.sink,
 	})
 	if err == nil {
 		t.Fatalf("expected error on cancelled context")
@@ -335,6 +306,8 @@ func TestExecuteJob_UserCancelFlag(t *testing.T) {
 	counts, err := env.p.executeJob(ctx, &jobExecutionParams{
 		updater: env.updater,
 		jobInfo: jobInfo,
+		jobItem:    env.jobItem,
+		resultSink: env.sink,
 	})
 	if !errors.Is(err, batchctx.ErrCancelled) {
 		t.Fatalf("expected batchctx.ErrCancelled, got: %v", err)
@@ -374,6 +347,8 @@ func TestExecuteJob_CancelAfterAllRequestsComplete(t *testing.T) {
 	_, err := env.p.executeJob(ctx, &jobExecutionParams{
 		updater: env.updater,
 		jobInfo: jobInfo,
+		jobItem:    env.jobItem,
+		resultSink: env.sink,
 	})
 	if !errors.Is(err, batchctx.ErrCancelled) {
 		t.Fatalf("expected batchctx.ErrCancelled when cancel arrives after all requests complete, got: %v", err)
@@ -406,6 +381,8 @@ func TestExecuteJob_SIGTERMAfterAllComplete(t *testing.T) {
 	counts, err := env.p.executeJob(mainCtx, &jobExecutionParams{
 		updater: env.updater,
 		jobInfo: jobInfo,
+		jobItem:    env.jobItem,
+		resultSink: env.sink,
 	})
 	if err != nil {
 		t.Fatalf("expected nil error when SIGTERM arrives after all requests complete, got: %v", err)
@@ -457,6 +434,8 @@ func TestExecuteJob_AbortCtxCancel_AbortsInflightRequests(t *testing.T) {
 	params := &jobExecutionParams{
 		updater:    env.updater,
 		jobInfo:    jobInfo,
+		jobItem:    env.jobItem,
+		resultSink: env.sink,
 		cancelUser: cancelUser,
 	}
 	type result struct {
@@ -518,6 +497,8 @@ func TestExecuteJob_SLOExpiredBeforeDispatch(t *testing.T) {
 	counts, err := env.p.executeJob(ctx, &jobExecutionParams{
 		updater: env.updater,
 		jobInfo: jobInfo,
+		jobItem:    env.jobItem,
+		resultSink: env.sink,
 	})
 	if !errors.Is(err, batchctx.ErrExpired) {
 		t.Fatalf("expected batchctx.ErrExpired, got: %v", err)
@@ -536,23 +517,11 @@ func TestExecuteJob_SLOExpiredBeforeDispatch(t *testing.T) {
 		t.Fatalf("Failed = %d, want 3 (all requests drained as batch_expired)", counts.Failed)
 	}
 
-	errorPath, _ := env.p.jobErrorFilePath(jobInfo.JobID, jobInfo.TenantID)
-	errorData, readErr := os.ReadFile(errorPath)
-	if readErr != nil {
-		t.Fatalf("error.jsonl should exist: %v", readErr)
-	}
-	errorLines := bytes.Count(bytes.TrimSpace(errorData), []byte("\n")) + 1
-	if errorLines != 3 {
-		t.Fatalf("error.jsonl lines = %d, want 3", errorLines)
-	}
-
-	outputPath, _ := env.p.jobOutputFilePath(jobInfo.JobID, jobInfo.TenantID)
-	outputData, readErr := os.ReadFile(outputPath)
-	if readErr != nil {
-		t.Fatalf("output.jsonl should exist: %v", readErr)
-	}
-	if len(outputData) != 0 {
-		t.Fatalf("output.jsonl should be empty, got %d bytes", len(outputData))
+	// Every entry commits as failed with the batch_expired error code.
+	for customID, entry := range listEntriesByCustomID(t, env.p, jobInfo.JobID) {
+		if entry.Status != db.ResumableEntryFailed || entry.ErrorCode != string(batch_types.ErrCodeBatchExpired) {
+			t.Errorf("entry %s = %s/%s, want failed/%s", customID, entry.Status, entry.ErrorCode, batch_types.ErrCodeBatchExpired)
+		}
 	}
 }
 
@@ -601,6 +570,8 @@ func TestExecuteJob_SLOExpiredDuringDispatch(t *testing.T) {
 		counts, err := env.p.executeJob(ctx, &jobExecutionParams{
 			updater: env.updater,
 			jobInfo: jobInfo,
+			jobItem:    env.jobItem,
+			resultSink: env.sink,
 		})
 		resCh <- result{counts, err}
 	}()
@@ -625,19 +596,17 @@ func TestExecuteJob_SLOExpiredDuringDispatch(t *testing.T) {
 			t.Errorf("Failed = %d, want 2 (undispatched drained as expired)", res.counts.Failed)
 		}
 
-		// Verify the error file contains batch_expired entries for undispatched requests.
-		errorPath, _ := env.p.jobErrorFilePath(jobInfo.JobID, jobInfo.TenantID)
-		errLines := readNonEmptyJSONLLines(t, errorPath)
-		if len(errLines) != 2 {
-			t.Fatalf("error.jsonl lines = %d, want 2", len(errLines))
-		}
-		for i, line := range errLines {
-			var entry outputLine
-			if err := json.Unmarshal(line, &entry); err != nil {
-				t.Fatalf("unmarshal error line %d: %v", i, err)
+		// The undispatched entries commit as failed with the batch_expired
+		// error code; the completed one commits as completed.
+		for customID, entry := range listEntriesByCustomID(t, env.p, jobInfo.JobID) {
+			if customID == "r1" {
+				if entry.Status != db.ResumableEntryCompleted {
+					t.Errorf("entry r1 = %s, want completed", entry.Status)
+				}
+				continue
 			}
-			if entry.Error == nil || entry.Error.Code != string(batch_types.ErrCodeBatchExpired) {
-				t.Errorf("error line %d: expected code %s, got %+v", i, batch_types.ErrCodeBatchExpired, entry.Error)
+			if entry.Status != db.ResumableEntryFailed || entry.ErrorCode != string(batch_types.ErrCodeBatchExpired) {
+				t.Errorf("entry %s = %s/%s, want failed/%s", customID, entry.Status, entry.ErrorCode, batch_types.ErrCodeBatchExpired)
 			}
 		}
 	case <-time.After(5 * time.Second):
@@ -769,6 +738,8 @@ func TestExecuteJob_SeparatesSuccessAndErrors(t *testing.T) {
 	counts, err := env.p.executeJob(ctx, &jobExecutionParams{
 		updater: env.updater,
 		jobInfo: jobInfo,
+		jobItem:    env.jobItem,
+		resultSink: env.sink,
 	})
 	if err != nil {
 		t.Fatalf("executeJob error: %v", err)
@@ -777,30 +748,22 @@ func TestExecuteJob_SeparatesSuccessAndErrors(t *testing.T) {
 		t.Fatalf("counts: completed=%d failed=%d, want completed=1 failed=1", counts.Completed, counts.Failed)
 	}
 
-	outputPath, _ := env.p.jobOutputFilePath(jobInfo.JobID, jobInfo.TenantID)
-	outputLines := readNonEmptyJSONLLines(t, outputPath)
-	if len(outputLines) != 1 {
-		t.Fatalf("output.jsonl lines = %d, want 1", len(outputLines))
+	// Exactly one entry commits completed and one failed. (Which custom ID
+	// gets which is dispatch-order dependent; the line-level routing of the
+	// committed results is finalization's concern.)
+	var completed, failed int
+	for _, entry := range listEntriesByCustomID(t, env.p, jobInfo.JobID) {
+		switch entry.Status {
+		case db.ResumableEntryCompleted:
+			completed++
+		case db.ResumableEntryFailed:
+			failed++
+		default:
+			t.Errorf("entry %s = %s, want terminal", entry.CustomID, entry.Status)
+		}
 	}
-	var outLine outputLine
-	if err := json.Unmarshal(outputLines[0], &outLine); err != nil {
-		t.Fatalf("unmarshal output line: %v", err)
-	}
-	if outLine.Response == nil || outLine.Error != nil {
-		t.Fatalf("output line: want response set and error nil, got response=%v error=%v", outLine.Response, outLine.Error)
-	}
-
-	errorPath, _ := env.p.jobErrorFilePath(jobInfo.JobID, jobInfo.TenantID)
-	errorLines := readNonEmptyJSONLLines(t, errorPath)
-	if len(errorLines) != 1 {
-		t.Fatalf("error.jsonl lines = %d, want 1", len(errorLines))
-	}
-	var errLine outputLine
-	if err := json.Unmarshal(errorLines[0], &errLine); err != nil {
-		t.Fatalf("unmarshal error line: %v", err)
-	}
-	if errLine.Error == nil || errLine.Response != nil {
-		t.Fatalf("error line: want error set and response nil, got response=%v error=%v", errLine.Response, errLine.Error)
+	if completed != 1 || failed != 1 {
+		t.Fatalf("entries: completed=%d failed=%d, want 1/1", completed, failed)
 	}
 }
 
@@ -849,6 +812,8 @@ func TestExecuteJob_HTTPErrorGoesToOutputFile(t *testing.T) {
 	counts, err := env.p.executeJob(ctx, &jobExecutionParams{
 		updater: env.updater,
 		jobInfo: jobInfo,
+		jobItem:    env.jobItem,
+		resultSink: env.sink,
 	})
 	if err != nil {
 		t.Fatalf("executeJob error: %v", err)
@@ -861,64 +826,29 @@ func TestExecuteJob_HTTPErrorGoesToOutputFile(t *testing.T) {
 		t.Fatalf("Failed = %d, want 2", counts.Failed)
 	}
 
-	// output.jsonl should contain 2 lines: the 200 success AND the HTTP 422 error.
-	outputPath, _ := env.p.jobOutputFilePath(jobInfo.JobID, jobInfo.TenantID)
-	outputLines := readNonEmptyJSONLLines(t, outputPath)
-	if len(outputLines) != 2 {
-		t.Fatalf("output.jsonl lines = %d, want 2", len(outputLines))
-	}
-
-	// Verify both output lines: one success (200) and one HTTP error (422).
-	var found200, found422 bool
-	for _, line := range outputLines {
-		var entry outputLine
-		if err := json.Unmarshal(line, &entry); err != nil {
-			t.Fatalf("unmarshal output line: %v", err)
-		}
-		if entry.Error != nil {
-			t.Fatalf("output line should not have error field, got: %+v", entry.Error)
-		}
-		if entry.Response == nil {
-			t.Fatalf("output line should have response field")
-		}
-		switch entry.Response.StatusCode {
-		case 200:
-			found200 = true
-		case 422:
-			found422 = true
-			errObj, ok := entry.Response.Body["error"].(map[string]interface{})
-			if !ok {
-				t.Fatalf("HTTP error response body should contain error object, got: %v", entry.Response.Body)
+	// Entry classification mirrors the OpenAI batch contract at the
+	// checkpoint level: the 200 and the HTTP 422 both complete entries (the
+	// 422 keeps no error code — its preserved HTTP response routes the line
+	// to the output artifact at finalization); the non-HTTP error commits a
+	// failed entry carrying the error code.
+	var httpLike, errored int
+	for _, entry := range listEntriesByCustomID(t, env.p, jobInfo.JobID) {
+		switch {
+		case entry.Status == db.ResumableEntryCompleted:
+			httpLike++
+		case entry.Status == db.ResumableEntryFailed && entry.ErrorCode == "":
+			httpLike++
+		case entry.Status == db.ResumableEntryFailed:
+			if entry.ErrorCode != string(httpclient.ErrCategoryServer) {
+				t.Errorf("entry %s error code = %q, want %q", entry.CustomID, entry.ErrorCode, httpclient.ErrCategoryServer)
 			}
-			if errObj["code"] != "model_not_found" {
-				t.Fatalf("expected error code 'model_not_found', got: %v", errObj["code"])
-			}
+			errored++
 		default:
-			t.Fatalf("unexpected status code %d in output file", entry.Response.StatusCode)
+			t.Errorf("entry %s = %s, want terminal", entry.CustomID, entry.Status)
 		}
 	}
-	if !found200 || !found422 {
-		t.Fatalf("expected both 200 and 422 in output file, found200=%v found422=%v", found200, found422)
-	}
-
-	// error.jsonl should contain 1 line: the non-HTTP error only.
-	errorPath, _ := env.p.jobErrorFilePath(jobInfo.JobID, jobInfo.TenantID)
-	errorLines := readNonEmptyJSONLLines(t, errorPath)
-	if len(errorLines) != 1 {
-		t.Fatalf("error.jsonl lines = %d, want 1", len(errorLines))
-	}
-	var errEntry outputLine
-	if err := json.Unmarshal(errorLines[0], &errEntry); err != nil {
-		t.Fatalf("unmarshal error line: %v", err)
-	}
-	if errEntry.Error == nil {
-		t.Fatalf("error file line should have error field")
-	}
-	if errEntry.Response != nil {
-		t.Fatalf("error file line should not have response field")
-	}
-	if errEntry.Error.Code != string(httpclient.ErrCategoryServer) {
-		t.Fatalf("error code = %q, want %q", errEntry.Error.Code, httpclient.ErrCategoryServer)
+	if httpLike != 2 || errored != 1 {
+		t.Fatalf("entries: http-like=%d errored=%d, want 2/1", httpLike, errored)
 	}
 }
 

@@ -1694,6 +1694,112 @@ func TestPreProcess_UnregisteredModel_RejectedToErrorFile(t *testing.T) {
 	}
 }
 
+// TestPreProcess_UnregisteredModel_AsyncMode_Rejected mirrors the per-model
+// sync test for async dispatch: registration is resolved by the bare model ID
+// (the key the async dispatch path uses), and the rejection lands in the
+// manifest with a stable request ID and result key so activation persists it
+// as a durable error object instead of a local error.jsonl line.
+func TestPreProcess_UnregisteredModel_AsyncMode_Rejected(t *testing.T) {
+	ctx := testLoggerCtx(t)
+
+	cfg := config.NewConfig()
+	cfg.WorkDir = t.TempDir()
+
+	dbClient := newMockBatchDBClient()
+	fileDBClient := newMockFileDBClient()
+	filesClient := mockfiles.NewMockBatchFilesClient(t.TempDir())
+
+	tenantID := "tenant__tenantA"
+	folder, _ := ucom.GetFolderNameByTenantID(tenantID)
+	filename := "input.jsonl"
+
+	lines := [][]byte{
+		[]byte(`{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"model-a","messages":[{"role":"user","content":"hi"}]}}` + "\n"),
+		[]byte(`{"custom_id":"req-2","method":"POST","url":"/v1/chat/completions","body":{"model":"model-b","messages":[{"role":"user","content":"hi"}]}}` + "\n"),
+	}
+	var remoteBuf bytes.Buffer
+	for _, ln := range lines {
+		remoteBuf.Write(ln)
+	}
+
+	inputFileID := "file-unregistered-async"
+	if _, err := filesClient.Store(ctx, ucom.FileStorageName(inputFileID, filename), folder, 0, 0, bytes.NewReader(remoteBuf.Bytes())); err != nil {
+		t.Fatalf("files.Store: %v", err)
+	}
+	fileSpec := &openai.FileObject{Filename: filename}
+	fileItem := &db.FileItem{
+		BaseIndexes:  db.BaseIndexes{ID: inputFileID, TenantID: tenantID},
+		BaseContents: db.BaseContents{Spec: mustJSON(t, fileSpec)},
+	}
+	if err := fileDBClient.DBStore(ctx, fileItem); err != nil {
+		t.Fatalf("DBStore file item: %v", err)
+	}
+
+	clients := &clientset.Clientset{
+		BatchDB: dbClient,
+		FileDB:  fileDBClient,
+		File:    filesClient,
+		AsyncInference: inference.NewTestAsyncResolver(map[string]func() inference.AsyncInferenceClient{
+			"model-a": func() inference.AsyncInferenceClient { return &fakeAsyncInferenceClient{} },
+		}),
+		Resumable: mockdb.NewMockResumableStore(),
+	}
+	p := mustNewProcessor(t, cfg, clients)
+
+	jobID := "job-unregistered-async"
+	jobInfo := &batch_types.JobInfo{
+		JobID: jobID,
+		BatchJob: &openai.Batch{
+			ID:              jobID,
+			BatchSpec:       openai.BatchSpec{InputFileID: inputFileID, Endpoint: openai.EndpointChatCompletions},
+			BatchStatusInfo: openai.BatchStatusInfo{Status: openai.BatchStatusInProgress},
+		},
+		TenantID: tenantID,
+	}
+
+	manifest, err := p.preProcessJob(ctx, jobInfo)
+	if err != nil {
+		t.Fatalf("preProcessJob: %v", err)
+	}
+
+	if len(manifest.Entries) != 2 {
+		t.Fatalf("manifest entries = %d, want 2", len(manifest.Entries))
+	}
+	if manifest.Entries[0].Rejected {
+		t.Fatal("registered model-a must not be rejected")
+	}
+	rejected := manifest.Entries[1]
+	if !rejected.Rejected {
+		t.Fatal("model-b entry must be rejected")
+	}
+	if rejected.ErrorCode != inference.ErrCodeModelNotFound {
+		t.Fatalf("error code = %s, want %s", rejected.ErrorCode, inference.ErrCodeModelNotFound)
+	}
+	wantID := stableBatchRequestID(jobID, "req-2")
+	if rejected.RequestID != wantID {
+		t.Fatalf("request ID = %s, want %s", rejected.RequestID, wantID)
+	}
+	if rejected.ResultKey != resumableResultKey(jobID, wantID) {
+		t.Fatalf("result key = %s, want %s", rejected.ResultKey, resumableResultKey(jobID, wantID))
+	}
+
+	// The model map mirrors the sync behavior: one rejection, model-b absent.
+	jobRootDir, _ := p.jobRootDir(jobID, tenantID)
+	mm, err := readModelMap(jobRootDir)
+	if err != nil {
+		t.Fatalf("readModelMap: %v", err)
+	}
+	if mm.RejectedCount != 1 {
+		t.Fatalf("RejectedCount = %d, want 1", mm.RejectedCount)
+	}
+	if _, ok := mm.ModelToSafe["model-b"]; ok {
+		t.Fatal("model-b should not appear in model map (rejected during ingestion)")
+	}
+	if _, ok := mm.ModelToSafe["model-a"]; !ok {
+		t.Fatal("model-a missing from model map")
+	}
+}
+
 // TestPreProcess_AllRequestsUnregistered_ExecuteJobCounts covers the edge case where every
 // line targets an unregistered model: modelToSafe is empty, no plan files are written,
 // executeJob launches zero processModel goroutines, progress is seeded from RejectedCount,
@@ -1813,9 +1919,12 @@ func TestPreProcess_AllRequestsUnregistered_ExecuteJobCounts(t *testing.T) {
 		t.Fatalf("plan files = %d, want 0", planFiles)
 	}
 
+	sink, jobItem := activateJobEntries(t, p, jobID, tenantID, []string{"req-1", "req-2", "req-3"})
 	counts, execErr := p.executeJob(ctx, &jobExecutionParams{
-		updater: NewStatusUpdater(dbClient),
-		jobInfo: jobInfo,
+		updater:    NewStatusUpdater(dbClient),
+		jobInfo:    jobInfo,
+		jobItem:    jobItem,
+		resultSink: sink,
 	})
 	if execErr != nil {
 		t.Fatalf("executeJob: %v", execErr)
@@ -1922,114 +2031,3 @@ func TestPreProcess_ReEnqueue_TruncatesStaleErrorFile(t *testing.T) {
 // TestPreProcess_ModelNotFound_ThenEarlySLO_PreservesErrorFile verifies that
 // when ingestion writes model_not_found entries and execution hits early SLO
 // expiration, the error file is preserved (not truncated by execution).
-func TestPreProcess_ModelNotFound_ThenEarlySLO_PreservesErrorFile(t *testing.T) {
-	ctx := testLoggerCtx(t)
-
-	workDir := t.TempDir()
-	cfg := config.NewConfig()
-	cfg.WorkDir = workDir
-
-	dbClient := newMockBatchDBClient()
-	fileDBClient := newMockFileDBClient()
-	filesClient := mockfiles.NewMockBatchFilesClient(t.TempDir())
-
-	tenantID := "tenant__tenantA"
-	folder, _ := ucom.GetFolderNameByTenantID(tenantID)
-	filename := "input.jsonl"
-
-	// 2 requests: model-a (registered), model-b (NOT registered)
-	lines := [][]byte{
-		[]byte(`{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"model-a","messages":[{"role":"user","content":"hi"}]}}` + "\n"),
-		[]byte(`{"custom_id":"req-2","method":"POST","url":"/v1/chat/completions","body":{"model":"model-b","messages":[{"role":"user","content":"hi"}]}}` + "\n"),
-	}
-	var remoteBuf bytes.Buffer
-	for _, ln := range lines {
-		remoteBuf.Write(ln)
-	}
-
-	inputFileID := "file-slo-preserve"
-	if _, err := filesClient.Store(ctx, ucom.FileStorageName(inputFileID, filename), folder, 0, 0, bytes.NewReader(remoteBuf.Bytes())); err != nil {
-		t.Fatalf("files.Store: %v", err)
-	}
-	fileSpec := &openai.FileObject{Filename: filename}
-	fileItem := &db.FileItem{
-		BaseIndexes:  db.BaseIndexes{ID: inputFileID, TenantID: tenantID},
-		BaseContents: db.BaseContents{Spec: mustJSON(t, fileSpec)},
-	}
-	if err := fileDBClient.DBStore(ctx, fileItem); err != nil {
-		t.Fatalf("DBStore file item: %v", err)
-	}
-
-	resolver, err := inference.NewPerModelResolver(
-		map[string]inference.GatewayClientConfig{
-			"model-a": {URL: "http://fake:8000"},
-		},
-		testLogger(t),
-	)
-	if err != nil {
-		t.Fatalf("NewPerModelResolver: %v", err)
-	}
-
-	clients := &clientset.Clientset{
-		BatchDB:   dbClient,
-		FileDB:    fileDBClient,
-		File:      filesClient,
-		Inference: resolver,
-	}
-	p := mustNewProcessor(t, cfg, clients)
-
-	jobID := "job-slo-preserve"
-	jobInfo := &batch_types.JobInfo{
-		JobID: jobID,
-		BatchJob: &openai.Batch{
-			ID:              jobID,
-			BatchSpec:       openai.BatchSpec{InputFileID: inputFileID, Endpoint: openai.EndpointChatCompletions},
-			BatchStatusInfo: openai.BatchStatusInfo{Status: openai.BatchStatusInProgress},
-		},
-		TenantID: tenantID,
-	}
-
-	// Run ingestion — should reject model-b and write to error.jsonl.
-	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
-		t.Fatalf("preProcessJob: %v", err)
-	}
-
-	// Verify error.jsonl has 1 model_not_found entry before execution.
-	errorPath, _ := p.jobErrorFilePath(jobID, tenantID)
-	errorBytes, err := os.ReadFile(errorPath)
-	if err != nil {
-		t.Fatalf("read error file: %v", err)
-	}
-	errorLines := bytes.Split(bytes.TrimSpace(errorBytes), []byte{'\n'})
-	if len(errorLines) != 1 {
-		t.Fatalf("error file lines before execution = %d, want 1", len(errorLines))
-	}
-
-	// Simulate early SLO expiration: create an already-expired context.
-	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(-time.Second))
-	defer sloCancel()
-
-	counts, execErr := p.executeJob(sloCtx, &jobExecutionParams{
-		updater: NewStatusUpdater(dbClient),
-		jobInfo: jobInfo,
-	})
-	if !errors.Is(execErr, batchctx.ErrExpired) {
-		t.Fatalf("expected batchctx.ErrExpired, got: %v", execErr)
-	}
-	// Failed = 2: 1 model_not_found (ingestion) + 1 batch_expired (pipeline drain for model-a).
-	if counts.Failed != 2 {
-		t.Fatalf("Failed = %d, want 2 (1 model_not_found + 1 batch_expired)", counts.Failed)
-	}
-
-	// error.jsonl should have both the model_not_found and batch_expired entries.
-	errorBytesAfter, err := os.ReadFile(errorPath)
-	if err != nil {
-		t.Fatalf("read error file after execution: %v", err)
-	}
-	if !bytes.Contains(errorBytesAfter, []byte(`"model_not_found"`)) {
-		t.Fatalf("error file lost model_not_found entry after early SLO:\n%s", errorBytesAfter)
-	}
-	if !bytes.Contains(errorBytesAfter, []byte(`"batch_expired"`)) {
-		t.Fatalf("error file missing batch_expired entry for undispatched request:\n%s", errorBytesAfter)
-	}
-}

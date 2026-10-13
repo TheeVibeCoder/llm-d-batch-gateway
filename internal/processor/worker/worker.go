@@ -73,8 +73,9 @@ type Processor struct {
 	batchDB        db.BatchDBClient                // job status lookups
 	event          db.BatchEventChannelClient      // cancel-event subscription
 	inference      *inference.GatewayResolver      // model → gateway routing (sync)
-	asyncInference *inference.AsyncGatewayResolver // model → async client routing
+	asyncInference *inference.AsyncGatewayResolver // model → async client routing (durable pipeline)
 	broadcasters   *broadcasterRegistry            // per-model result broadcasters (async only)
+	resumable      db.ResumableStore               // durable pipeline state (async only)
 	files          *fileManager
 }
 
@@ -89,6 +90,14 @@ func NewProcessor(
 	}
 	if cfg.Concurrency.Global <= 0 {
 		return nil, fmt.Errorf("global semaphore (concurrency.global=%d): %w", cfg.Concurrency.Global, semaphore.ErrCap)
+	}
+	// The resumable pipeline is the only pipeline: activation, entry
+	// checkpointing, and fenced finalization are required to run any batch.
+	if clients.Resumable == nil {
+		return nil, fmt.Errorf("resumable store client is required")
+	}
+	if clients.File == nil {
+		return nil, fmt.Errorf("files store client is required")
 	}
 	endpointAllowlist, err := openai.NewEndpointAllowlist(cfg.ExtraEndpoints)
 	if err != nil {
@@ -106,6 +115,7 @@ func NewProcessor(
 		event:             clients.Event,
 		inference:         clients.Inference,
 		asyncInference:    clients.AsyncInference,
+		resumable:         clients.Resumable,
 		files:             newFileManager(clients.File, clients.FileDB),
 	}, nil
 }

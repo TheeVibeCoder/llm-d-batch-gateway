@@ -186,9 +186,14 @@ func (m *MockDBClient[T, Q]) DBUpdate(ctx context.Context, item *T, expectedStat
 		expectedResumableField := updateVal.FieldByName("ExpectedResumable")
 		if expectedResumableField.IsValid() && expectedResumableField.Kind() == reflect.Pointer && !expectedResumableField.IsNil() {
 			existingResumable := val.FieldByName("Resumable")
-			if existingResumable.IsValid() && existingResumable.Kind() == reflect.Bool &&
-				existingResumable.Bool() != expectedResumableField.Elem().Bool() {
-				return fmt.Errorf("DBUpdate: %w", api.ErrConflict)
+			if existingResumable.IsValid() && existingResumable.Kind() == reflect.Bool {
+				if existingResumable.Bool() != expectedResumableField.Elem().Bool() {
+					return fmt.Errorf("DBUpdate: %w", api.ErrConflict)
+				}
+				// Postgres uses resumable only as a WHERE condition — a status
+				// write never changes the column. The item replacement below
+				// must not drop it, or a later fenced write would conflict.
+				reflect.ValueOf(item).Elem().FieldByName("Resumable").SetBool(existingResumable.Bool())
 			}
 		}
 	}

@@ -55,6 +55,11 @@ func TestRecoverOwnedJobsFencesPreviousEpoch(t *testing.T) {
 		t.Fatalf("NewPostgresBatchQueueClient: %v", err)
 	}
 	t.Cleanup(func() { _ = queue.Close() })
+	resumable, err := postgresql.NewPostgresResumableStore(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewPostgresResumableStore: %v", err)
+	}
+	t.Cleanup(func() { _ = resumable.Close() })
 	pool, err := pgxpool.New(ctx, url)
 	if err != nil {
 		t.Fatalf("pgxpool: %v", err)
@@ -74,6 +79,7 @@ func TestRecoverOwnedJobsFencesPreviousEpoch(t *testing.T) {
 		Queue:           queue,
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		Resumable:       resumable,
 	}, processorID, testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -165,6 +171,11 @@ func TestRecoverOwnedJobsFinalizesCancellationAfterEnqueueConflict(t *testing.T)
 		t.Fatalf("NewPostgresBatchQueueClient: %v", err)
 	}
 	t.Cleanup(func() { _ = queue.Close() })
+	resumable, err := postgresql.NewPostgresResumableStore(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewPostgresResumableStore: %v", err)
+	}
+	t.Cleanup(func() { _ = resumable.Close() })
 	pool, err := pgxpool.New(ctx, url)
 	if err != nil {
 		t.Fatalf("pgxpool: %v", err)
@@ -184,6 +195,7 @@ func TestRecoverOwnedJobsFinalizesCancellationAfterEnqueueConflict(t *testing.T)
 		Queue:           queue,
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		Resumable:       resumable,
 	}, processorID, testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)

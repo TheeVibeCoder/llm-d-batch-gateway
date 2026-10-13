@@ -112,15 +112,34 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 	seenCustomIDs := make(map[string]struct{})
 
 	// streaming loop
-	// In per-model mode, check each model against the resolver and reject
-	// unregistered models early. In global mode, all models are routed to
-	// the same endpoint so no check is needed.
-	// p.inference != nil: NewProcessor does not validate clients; unit tests often
-	// call preProcessJob without Run() and omit Inference (treat as non-per-model).
-	// Production paths hit Processor.validate() in prepare() before work runs.
-	// The guard also avoids panicking if a future caller wires a nil resolver.
-	isPerModelGateway := p.inference != nil && !p.inference.IsGlobal()
-	registeredModels := make(map[string]bool) // route key -> registered (per-model only)
+	// Reject unregistered models at ingestion. Per-model sync gateways resolve
+	// by route key; async pools resolve by the bare model ID — the same key
+	// their dispatch paths use, so the error-metric label stays consistent.
+	// In global mode, all models are routed to the same endpoint so no check
+	// is needed. The nil-resolver guards keep unit-test constructions that
+	// omit clients on the no-check path; production paths hit
+	// Processor.validate() in prepare() before work runs.
+	var lookupModel func(modelID string) (key string, registered bool)
+	registeredModels := make(map[string]bool) // route key -> registered (per-model sync only)
+	switch {
+	case p.inference != nil && !p.inference.IsGlobal():
+		lookupModel = func(modelID string) (string, bool) {
+			// Look up the gateway by the route key (tenant-scoped when
+			// route_key_method is "tenant"). The raw model ID stays in the
+			// error message and plan grouping below.
+			key := routeKey(p.cfg.RouteKeyMethod, jobInfo.TenantID, modelID)
+			if registered, checked := registeredModels[key]; checked {
+				return key, registered
+			}
+			registered := p.inference.ClientFor(key) != nil
+			registeredModels[key] = registered
+			return key, registered
+		}
+	case p.asyncInference != nil:
+		lookupModel = func(modelID string) (string, bool) {
+			return modelID, p.asyncInference.SharedClientFor(modelID) != nil
+		}
+	}
 
 	// Always truncate error.jsonl at the start of ingestion so that re-enqueued
 	// jobs don't carry stale error entries from a previous attempt.
@@ -179,16 +198,8 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 		}
 		seenCustomIDs[requestMeta.CustomID] = struct{}{}
 
-		if isPerModelGateway {
-			// Look up the gateway by the route key (tenant-scoped when
-			// route_key_method is "tenant"). The raw model ID stays in the
-			// error message and plan grouping below.
-			lookupID := routeKey(p.cfg.RouteKeyMethod, jobInfo.TenantID, requestMeta.ModelID)
-			registered, checked := registeredModels[lookupID]
-			if !checked {
-				registered = p.inference.ClientFor(lookupID) != nil
-				registeredModels[lookupID] = registered
-			}
+		if lookupModel != nil {
+			lookupID, registered := lookupModel(requestMeta.ModelID)
 			if !registered {
 				// No plan entry exists yet, so derive the request ID from the
 				// batch and custom IDs. The ID is stable, so re-preprocessing
@@ -213,8 +224,8 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 				rejectedCount++
 				manifest.add(rejectedEntry(jobID, lineCount-1, requestMeta.CustomID, requestID,
 					inference.ErrCodeModelNotFound, lineBytes))
-				// Error metric rides the route key so labels stay consistent
-				// with the dispatch path, whose items carry the scoped ID.
+				// Error metric rides the lookup key so labels stay consistent
+				// with the dispatch path.
 				metrics.RecordRequestError(lookupID)
 				logger.V(logging.DEBUG).Info("Rejected request for unregistered model",
 					"customId", requestMeta.CustomID, "model", requestMeta.ModelID)

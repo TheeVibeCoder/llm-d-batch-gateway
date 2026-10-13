@@ -540,15 +540,25 @@ func (f requestSourceFunc) Produce(ctx context.Context, out chan<- RequestItem) 
 
 func TestAsyncCancellation(t *testing.T) {
 	tests := []struct {
-		name          string
-		cancelCause   error
+		name string
+		// cancelCause trips the abort context (or is returned by the source).
+		cancelCause error
+		// sourceFailure makes the request source itself fail instead of
+		// cancelling the context.
 		sourceFailure bool
 		wantCode      string
+		// wantQueueCancel expects the still-pending submissions to be
+		// cancelled in the shared queue. Only terminal aborts (user cancel,
+		// expiry) cancel: a stop that leads to a resume must leave the
+		// submissions in place, or the queue's CANCELLED results for the
+		// same request IDs would poison the resumption.
+		wantQueueCancel bool
 	}{
 		{
-			name:        "user cancellation",
-			cancelCause: batchctx.ErrCancelled,
-			wantCode:    "batch_cancelled",
+			name:            "user cancellation",
+			cancelCause:     batchctx.ErrCancelled,
+			wantCode:        "batch_cancelled",
+			wantQueueCancel: true,
 		},
 		{
 			name:        "system cancellation",
@@ -567,14 +577,16 @@ func TestAsyncCancellation(t *testing.T) {
 			wantCode:      "batch_failed",
 		},
 		{
-			name:        "deadline expiry",
-			cancelCause: context.DeadlineExceeded,
-			wantCode:    "batch_expired",
+			name:            "deadline expiry",
+			cancelCause:     context.DeadlineExceeded,
+			wantCode:        "batch_expired",
+			wantQueueCancel: true,
 		},
 		{
-			name:        "batch expiry sentinel",
-			cancelCause: batchctx.ErrExpired,
-			wantCode:    "batch_expired",
+			name:            "batch expiry sentinel",
+			cancelCause:     batchctx.ErrExpired,
+			wantCode:        "batch_expired",
+			wantQueueCancel: true,
 		},
 	}
 
@@ -712,14 +724,18 @@ func TestAsyncCancellation(t *testing.T) {
 			client.mu.Lock()
 			cancelled := append([]string(nil), client.cancelledIDs...)
 			client.mu.Unlock()
-			wantCancelled := make([]string, 0, len(items)-3)
-			for _, item := range items[3:] {
-				wantCancelled = append(wantCancelled, item.RequestID)
-			}
-			slices.Sort(cancelled)
-			slices.Sort(wantCancelled)
-			if !slices.Equal(cancelled, wantCancelled) {
-				t.Errorf("cancelled IDs = %v, want %v", cancelled, wantCancelled)
+			if tt.wantQueueCancel {
+				wantCancelled := make([]string, 0, len(items)-3)
+				for _, item := range items[3:] {
+					wantCancelled = append(wantCancelled, item.RequestID)
+				}
+				slices.Sort(cancelled)
+				slices.Sort(wantCancelled)
+				if !slices.Equal(cancelled, wantCancelled) {
+					t.Errorf("cancelled IDs = %v, want %v", cancelled, wantCancelled)
+				}
+			} else if len(cancelled) != 0 {
+				t.Errorf("cancelled IDs = %v, want none: a resumable stop must not poison the queue", cancelled)
 			}
 		})
 	}
@@ -767,12 +783,12 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 		tracker := NewProgressTracker(3, nil, "test-job", 0, logr.Discard())
 		collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
 
-		dispatcher := NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard()).
-			WithBeforeSubmit(func(msg *RequestItem) error {
+		dispatcher := NewPreDispatcher(NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard())).
+			WithBeforeSubmit(func(msg *RequestItem) (bool, error) {
 				if msg.RequestID != "req-1" {
-					return fmt.Errorf("mark in-flight %s: %w", msg.RequestID, db.ErrConflict)
+					return false, fmt.Errorf("mark in-flight %s: %w", msg.RequestID, db.ErrConflict)
 				}
-				return nil
+				return true, nil
 			})
 
 		executor := NewJobExecutor(JobExecutorConfig{
@@ -822,12 +838,12 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 		tracker := NewProgressTracker(3, nil, "test-job", 0, logr.Discard())
 		collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
 
-		dispatcher := NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard()).
-			WithBeforeSubmit(func(msg *RequestItem) error {
+		dispatcher := NewPreDispatcher(NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard())).
+			WithBeforeSubmit(func(msg *RequestItem) (bool, error) {
 				if msg.RequestID == "req-2" {
-					return errors.New("db down")
+					return true, errors.New("db down")
 				}
-				return nil
+				return true, nil
 			})
 
 		executor := NewJobExecutor(JobExecutorConfig{
@@ -871,6 +887,53 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 		}
 		if errLine.Error == nil || errLine.Error.Code != "server_error" {
 			t.Fatalf("expected server_error, got %+v", errLine.Error)
+		}
+	})
+
+	t.Run("terminal entry drops without submitting", func(t *testing.T) {
+		client, resolver, broadcasters := newEnv(t)
+
+		pending := NewPendingRequests(0)
+		outputFile := tempFile(t)
+		errorFile := tempFile(t)
+		tracker := NewProgressTracker(3, nil, "test-job", 0, logr.Discard())
+		collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
+
+		dispatcher := NewPreDispatcher(NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard())).
+			WithBeforeSubmit(func(msg *RequestItem) (bool, error) {
+				// req-2's result was checkpointed by an earlier delivery.
+				return msg.RequestID != "req-2", nil
+			})
+
+		executor := NewJobExecutor(JobExecutorConfig{
+			Source:     &sliceSource{items: items()},
+			Dispatcher: dispatcher,
+			Collector:  collector,
+			Tracker:    tracker,
+			Logger:     logr.Discard(),
+		})
+
+		go func() {
+			for range 2 {
+				<-client.submittedCh
+			}
+			client.deliver("req-1", map[string]any{"ok": true})
+			client.deliver("req-3", map[string]any{"ok": true})
+		}()
+
+		counts, err := executor.Execute(context.Background())
+		if err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+
+		client.mu.Lock()
+		submitted := len(client.submitted)
+		client.mu.Unlock()
+		if submitted != 2 {
+			t.Errorf("submitted requests = %d, want 2 (req-2 is dropped)", submitted)
+		}
+		if counts.Completed != 2 || counts.Failed != 0 {
+			t.Errorf("counts = completed %d / failed %d, want 2 / 0", counts.Completed, counts.Failed)
 		}
 	})
 }

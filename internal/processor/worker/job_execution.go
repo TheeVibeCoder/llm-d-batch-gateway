@@ -43,5 +43,10 @@ type jobExecutionParams struct {
 	// Set by runJob, invoked by the per-job progress updater.
 	onOwnershipLost func()
 
+	// resultSink, when set, routes results through the durable checkpointing
+	// pipeline instead of the legacy local-file collector. runJob installs it
+	// after resumable activation succeeds.
+	resultSink *batchResultStore
+
 	requestCounts *openai.BatchRequestCounts
 }

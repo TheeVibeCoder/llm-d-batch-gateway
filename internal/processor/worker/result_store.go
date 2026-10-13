@@ -118,6 +118,24 @@ func (s *batchResultStore) Checkpoint(ctx context.Context, msg *pipeline.ResultI
 	return true, nil
 }
 
+// putRejectedObject stores the error object of a line rejected during
+// ingestion. The line is deterministic, so a PUT that finds the key already
+// present — an earlier attempt that crashed before activation — verifies the
+// bytes instead of failing.
+func (s *batchResultStore) putRejectedObject(ctx context.Context, e manifestEntry) error {
+	_, err := s.files.Store(ctx, e.ResultKey, s.folder, 0, 0, bytes.NewReader(e.ErrLine))
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, filesapi.ErrFileExists) {
+		return fmt.Errorf("store rejected result %s: %w", e.ResultKey, err)
+	}
+	if !s.verifyStored(ctx, e.ResultKey, e.ResultSHA256, e.ResultBytes) {
+		return fmt.Errorf("rejected result %s holds unexpected bytes", e.ResultKey)
+	}
+	return nil
+}
+
 // storeObject PUTs the line at its canonical result key. The file store is
 // create-only: when the key is taken, matching size and digest mean the object
 // is ours from an earlier attempt (retried PUT); different content means a

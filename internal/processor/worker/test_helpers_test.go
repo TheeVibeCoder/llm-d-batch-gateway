@@ -93,6 +93,67 @@ func (m *mockInferenceClient) Generate(ctx context.Context, req *inference.Gener
 	}, nil
 }
 
+// fakeAsyncInferenceClient is the worker-test stand-in for a shared async
+// client: Submit records the request and hands it to submittedCh; GetResult
+// serves responses pushed onto results.
+type fakeAsyncInferenceClient struct {
+	mu          sync.Mutex
+	submitted   []*inference.GenerateRequest
+	submittedCh chan *inference.GenerateRequest
+	results     chan *inference.GenerateResponse
+}
+
+var _ inference.AsyncInferenceClient = (*fakeAsyncInferenceClient)(nil)
+
+func (c *fakeAsyncInferenceClient) Submit(ctx context.Context, req *inference.GenerateRequest) *inference.ClientError {
+	c.mu.Lock()
+	c.submitted = append(c.submitted, req)
+	c.mu.Unlock()
+	if c.submittedCh != nil {
+		select {
+		case c.submittedCh <- req:
+		case <-ctx.Done():
+		}
+	}
+	return nil
+}
+
+func (c *fakeAsyncInferenceClient) GetResult(ctx context.Context) (*inference.GenerateResponse, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-c.results:
+		return r, nil
+	}
+}
+
+func (c *fakeAsyncInferenceClient) Cancel(context.Context, []string) error { return nil }
+func (c *fakeAsyncInferenceClient) Close() error                           { return nil }
+
+func (c *fakeAsyncInferenceClient) submitCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.submitted)
+}
+
+func (c *fakeAsyncInferenceClient) deliver(requestID string, body map[string]any) {
+	resp, _ := json.Marshal(body)
+	c.results <- &inference.GenerateResponse{
+		RequestID:  requestID,
+		Response:   resp,
+		StatusCode: 200,
+	}
+}
+
+// deliverStatus delivers a bare HTTP status with no body — e.g. a 403 from
+// auth — which the pipeline preserves in the output line.
+func (c *fakeAsyncInferenceClient) deliverStatus(requestID string, statusCode int) {
+	c.results <- &inference.GenerateResponse{
+		RequestID:  requestID,
+		StatusCode: statusCode,
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Mock files client (upload retry testing)
 // ---------------------------------------------------------------------------
@@ -363,6 +424,15 @@ func mustNewProcessor(t *testing.T, cfg *config.ProcessorConfig, clients *client
 			clients.BatchProgressDB = batchDB
 		}
 	}
+	// The resumable pipeline is the only pipeline: every test processor needs
+	// an entry store and a files store, even when the test never activates
+	// a batch.
+	if clients.Resumable == nil {
+		clients.Resumable = mockdb.NewMockResumableStore()
+	}
+	if clients.File == nil {
+		clients.File = mockfiles.NewMockBatchFilesClient(t.TempDir())
+	}
 	p, err := NewProcessor(cfg, clients, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -393,6 +463,7 @@ func validProcessorClients(t testing.TB) *clientset.Clientset {
 		Queue:           mockdb.NewMockBatchPriorityQueueClient(),
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		Resumable:       mockdb.NewMockResumableStore(),
 	}
 }
 
@@ -402,6 +473,10 @@ type testProcessorEnv struct {
 	dbClient db.BatchProgressDBClient
 	pqClient db.BatchPriorityQueueClient
 	updater  *StatusUpdater
+	// jobItem and sink are set by setupExecutionJob: the activated batch's
+	// DB item and its result sink, for tests that drive executeJob directly.
+	jobItem *db.BatchItem
+	sink    *batchResultStore
 }
 
 // newTestProcessorEnv creates a Processor wired with mock clients.
@@ -420,6 +495,7 @@ func newTestProcessorEnv(t *testing.T, cfg *config.ProcessorConfig, inferClient 
 		Queue:           pqClient,
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(inferClient),
+		Resumable:       mockdb.NewMockResumableStore(),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -481,7 +557,64 @@ func setupJobWithOutputFile(t *testing.T, cfg *config.ProcessorConfig, jobID, te
 	return &batch_types.JobInfo{JobID: jobID, TenantID: tenantID}
 }
 
-// setupExecutionJob creates a complete job directory with input file, plan files, and model map.
+// activateJobEntries seeds the processor's claim on the batch and activates
+// one pending entry per custom ID, returning the result sink and DB item.
+// It mirrors runJob's activation for tests that drive executeJob directly.
+func activateJobEntries(t *testing.T, p *Processor, jobID, tenantID string, customIDs []string) (*batchResultStore, *db.BatchItem) {
+	t.Helper()
+	store, ok := p.resumable.(*mockdb.MockResumableStore)
+	if !ok {
+		t.Fatalf("processor resumable store is %T, want *mockdb.MockResumableStore", p.resumable)
+	}
+	store.SeedBatch(jobID, "test-processor", 1)
+	entries := make([]db.ResumableActivationEntry, len(customIDs))
+	for i, customID := range customIDs {
+		entries[i] = db.ResumableActivationEntry{
+			RequestID: stableBatchRequestID(jobID, customID),
+			Ordinal:   int64(i),
+			CustomID:  customID,
+			Status:    string(db.ResumableEntryPending),
+		}
+	}
+	if err := store.ActivateResumableBatch(testLoggerCtx(t), &db.ResumableActivation{
+		BatchID:     jobID,
+		ProcessorID: "test-processor",
+		Epoch:       1,
+		LeaseTTL:    time.Minute,
+		Entries:     entries,
+	}); err != nil {
+		t.Fatalf("ActivateResumableBatch: %v", err)
+	}
+	sink, err := newBatchResultStore(p.files.storage, store, jobID, tenantID, "test-processor", 1)
+	if err != nil {
+		t.Fatalf("newBatchResultStore: %v", err)
+	}
+	return sink, &db.BatchItem{
+		BaseIndexes: db.BaseIndexes{ID: jobID, TenantID: tenantID},
+		Epoch:       1,
+	}
+}
+
+// listEntriesByCustomID returns the batch's committed entries keyed by
+// custom ID, for tests asserting how results were classified.
+func listEntriesByCustomID(t *testing.T, p *Processor, jobID string) map[string]*db.ResumableEntry {
+	t.Helper()
+	// Pagination is exclusive of afterOrdinal, so -1 includes ordinal 0.
+	entries, err := p.resumable.ListBatchEntries(context.Background(), jobID, -1, 1000)
+	if err != nil {
+		t.Fatalf("ListBatchEntries: %v", err)
+	}
+	m := make(map[string]*db.ResumableEntry, len(entries))
+	for _, e := range entries {
+		m[e.CustomID] = e
+	}
+	return m
+}
+
+// setupExecutionJob creates a complete job directory with input file, plan
+// files, and model map, then activates the batch in the processor's entry
+// store — mirroring runJob's activation — so tests that drive executeJob
+// directly checkpoint through a real sink.
 func setupExecutionJob(
 	t *testing.T,
 	cfg *config.ProcessorConfig,
@@ -535,6 +668,12 @@ func setupExecutionJob(
 		JobID:    jobID,
 		TenantID: tenantID,
 	}
+
+	customIDs := make([]string, len(requests))
+	for i, req := range requests {
+		customIDs[i] = req.CustomID
+	}
+	env.sink, env.jobItem = activateJobEntries(t, env.p, jobID, tenantID, customIDs)
 
 	return env, jobInfo
 }

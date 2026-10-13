@@ -164,11 +164,10 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 	params.eventWatcher = eventWatcher
 	go p.watchCancel(ctx, params)
 
-	// ingestion: pre-process job (rejects unregistered-model requests early)
+	// ingestion: pre-process job (rejects unregistered-model requests early).
 	ingestCtx, ingestSpan := uotel.StartSpan(abortCtx, "ingest-and-plan")
-	// The manifest feeds resumable activation (wired in a follow-up change);
-	// the legacy pipeline ignores it.
-	_, err = p.preProcessJob(ingestCtx, params.jobInfo)
+	// The manifest feeds the resumable activation.
+	manifest, err := p.preProcessJob(ingestCtx, params.jobInfo)
 	if err != nil && !batchctx.IsTerminal(err) {
 		ingestSpan.RecordError(err)
 		ingestSpan.SetStatus(codes.Error, "pre-process failed")
@@ -186,17 +185,31 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 		return
 	}
 
-	// transition to in_progress before executing requests
-	if err := params.updater.UpdatePersistentStatus(ctx, params.jobItem, openai.BatchStatusInProgress, nil, nil); err != nil {
-		logger.Error(err, "Failed to update status to in_progress")
+	// Take ownership of the batch with the fenced activation (entries +
+	// lease) instead of a plain status write; losing that race means another
+	// incarnation owns the batch.
+	sink, err := p.activateResumable(abortCtx, params, manifest)
+	if err != nil {
+		if errors.Is(err, db.ErrConflict) {
+			p.handleOwnershipLost(ctx, params)
+			return
+		}
+		logger.Error(err, "Failed to activate resumable batch")
 		span.RecordError(err)
-		span.SetStatus(codes.Error, "status transition failed")
+		span.SetStatus(codes.Error, "activation failed")
 		if failErr := p.handleFailed(ctx, params.updater, params.jobItem, nil, params.jobInfo); failErr != nil {
 			logger.Error(failErr, "Failed to handle failed event")
 		}
 		return
 	}
+	params.resultSink = sink
 	transitionedToInProgress = true
+	// Keep the ownership lease alive until runJob returns. Registered after
+	// the abortCause defer so it fires first on unwind (LIFO): the renewal
+	// goroutine stops before the neutral cause can trip it.
+	stopLeaseRenewal := make(chan struct{})
+	defer close(stopLeaseRenewal)
+	go p.renewBatchLease(abortCtx, params.jobItem, params.onOwnershipLost, stopLeaseRenewal)
 
 	// execution: execute inference requests
 	execCtx, execSpan := uotel.StartSpan(abortCtx, "execute-job")
@@ -231,8 +244,9 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 		return
 	}
 
-	// finalization: upload output, update status to completed
-	if err := p.finalizeJob(abortCtx, params.updater, params.jobItem, params.jobInfo, requestCounts); err != nil {
+	// finalization: final counts and artifacts are derived from the entry set.
+	finErr := p.finalizeResumableJob(abortCtx, params.updater, params.jobItem, params.jobInfo)
+	if err := finErr; err != nil {
 		if errors.Is(err, batchctx.ErrCancelled) {
 			// Cancel arrived during finalization — DB already updated to cancelled.
 			// Treat as successful cancellation (same as handleCancelled).

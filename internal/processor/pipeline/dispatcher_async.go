@@ -7,7 +7,6 @@ import (
 
 	"github.com/go-logr/logr"
 
-	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
@@ -15,18 +14,13 @@ import (
 
 // AsyncDispatcher submits requests to async queues (fire-and-forget).
 // Results arrive via per-model ResultBroadcasters (backed by shared
-// clients) that send directly to resultCh.
+// clients) that send directly to resultCh. The pre-dispatch ownership
+// fence lives in the PreDispatcher wrapping this dispatcher.
 type AsyncDispatcher struct {
 	resolver     *inference.AsyncGatewayResolver
 	broadcasters *BroadcasterGroup
 	pending      *PendingRequests
 	logger       logr.Logger
-	// beforeSubmit, when set, runs immediately before each submission. A
-	// db.ErrConflict return means the submitter no longer owns the batch: the
-	// dispatcher stops submitting (but keeps draining) so a zombie does not
-	// stream the remaining requests into the queue. Any other error is routed
-	// to the per-request error path like a submit failure.
-	beforeSubmit func(msg *RequestItem) error
 }
 
 var _ RequestDispatcher = (*AsyncDispatcher)(nil)
@@ -45,38 +39,15 @@ func NewAsyncDispatcher(
 	}
 }
 
-// WithBeforeSubmit installs a pre-submit hook (see AsyncDispatcher.beforeSubmit).
-func (d *AsyncDispatcher) WithBeforeSubmit(fn func(msg *RequestItem) error) *AsyncDispatcher {
-	d.beforeSubmit = fn
-	return d
-}
-
 func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem, resultCh chan<- ResultItem) error {
 	d.broadcasters.Subscribe(resultCh)
 
 	// Submit phase — fast queue writes.
-	var stopSubmitting bool
 	for msg := range requestCh {
-		if stopSubmitting {
-			// Ownership was lost mid-stream: drain the channel without
-			// submitting so the source is not left blocked on a send.
-			continue
-		}
 		client := d.resolver.SharedClientFor(msg.ModelID)
 		if client == nil {
 			resultCh <- *msg.ModelNotFound()
 			continue
-		}
-
-		if d.beforeSubmit != nil {
-			if err := d.beforeSubmit(&msg); err != nil {
-				if errors.Is(err, db.ErrConflict) {
-					stopSubmitting = true
-					continue
-				}
-				resultCh <- *msg.Error("server_error", err.Error())
-				continue
-			}
 		}
 
 		d.pending.Store(msg)
@@ -101,11 +72,20 @@ func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem,
 	d.pending.Wait(ctx)
 
 	// Best-effort: tell the queue to drop still-pending requests before
-	// dispatch. Use a detached context — ctx is often already cancelled.
-	if ids := d.pending.IDs(); len(ids) > 0 {
-		cancelCtx, cancelFn := context.WithTimeout(context.Background(), 5*time.Second)
-		d.cancelPending(cancelCtx, ids)
-		cancelFn()
+	// dispatch — but only when the batch is aborting for good (user cancel,
+	// SLO expiry). A stop that leads to a resume (shutdown, ownership loss)
+	// must not cancel: the queue turns a marked request into a CANCELLED
+	// result, and the next incarnation, which re-submits the same stable
+	// request IDs, would checkpoint that stale result as a request failure.
+	// Leftover submissions are harmless — dispatch is at-least-once and
+	// duplicate results are dropped on commit. Use a detached context —
+	// ctx is often already cancelled.
+	if cause := batchctx.Cause(ctx); errors.Is(cause, batchctx.ErrCancelled) || errors.Is(cause, batchctx.ErrExpired) {
+		if ids := d.pending.IDs(); len(ids) > 0 {
+			cancelCtx, cancelFn := context.WithTimeout(context.Background(), 5*time.Second)
+			d.cancelPending(cancelCtx, ids)
+			cancelFn()
+		}
 	}
 
 	// Drain submitted-but-uncollected requests as errors so that

@@ -39,6 +39,7 @@ func newRecoveryTestProcessor(t *testing.T, workDir string) (*Processor, db.Batc
 		Queue:           spyQueue,
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		Resumable:       mockdb.NewMockResumableStore(),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -195,6 +196,7 @@ func newRecoveryTestProcessorWithQueryFilter(t *testing.T, workDir string) (*Pro
 		Queue:           spyQueue,
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		Resumable:       mockdb.NewMockResumableStore(),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -839,6 +841,7 @@ func newRecoveryTestProcessorWithFailDB(t *testing.T, workDir string, failOn int
 		Queue:           pq,
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		Resumable:       mockdb.NewMockResumableStore(),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -877,6 +880,7 @@ func TestRecoverJob_Cancelling_AllUpdatesFail_ReturnsError(t *testing.T) {
 		Queue:           pq,
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		Resumable:       mockdb.NewMockResumableStore(),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -920,6 +924,7 @@ func TestRecoverJob_Validating_EnqueueFails_FallsBackToFailed(t *testing.T) {
 		Queue:           pq,
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		Resumable:       mockdb.NewMockResumableStore(),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -967,6 +972,7 @@ func TestRecoverJob_InProgressReEnqueue_EnqueueFails_FallsBackToFailed(t *testin
 		Queue:           pq,
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		Resumable:       mockdb.NewMockResumableStore(),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -1102,6 +1108,7 @@ func TestRecoverOwnedJobs_RunsConcurrently(t *testing.T) {
 		Queue:           pq,
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		Resumable:       mockdb.NewMockResumableStore(),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)
@@ -1283,6 +1290,7 @@ func TestRecoverJob_ExpiredWriteFails_FallbackToFailed(t *testing.T) {
 		Queue:           pq,
 		Event:           mockdb.NewMockBatchEventChannelClient(),
 		Inference:       inference.NewSingleClientResolver(&fakeInferenceClient{}),
+		Resumable:       mockdb.NewMockResumableStore(),
 	}, "test-processor", testLogger(t))
 	if err != nil {
 		t.Fatalf("NewProcessor: %v", err)

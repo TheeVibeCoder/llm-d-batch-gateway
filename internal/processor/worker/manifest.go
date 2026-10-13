@@ -36,6 +36,9 @@ type manifestEntry struct {
 	ResultKey    string
 	ResultBytes  int64
 	ResultSHA256 string
+	// ErrLine is the marshaled error-object line of a rejected entry
+	// (in-memory only), stored as its result object at activation.
+	ErrLine []byte
 }
 
 // requestManifest is the in-memory entry list of a preprocessed batch: the
@@ -50,7 +53,7 @@ func (m *requestManifest) add(e manifestEntry) {
 }
 
 // rejectedEntry records a line rejected during ingestion (e.g. unregistered
-// model), with the metadata of its error-object line.
+// model), with the metadata and bytes of its error-object line.
 func rejectedEntry(batchID string, ordinal int64, customID, requestID, errorCode string, errLine []byte) manifestEntry {
 	sum := sha256.Sum256(errLine)
 	return manifestEntry{
@@ -62,6 +65,7 @@ func rejectedEntry(batchID string, ordinal int64, customID, requestID, errorCode
 		ResultKey:    resumableResultKey(batchID, requestID),
 		ResultBytes:  int64(len(errLine)),
 		ResultSHA256: hex.EncodeToString(sum[:]),
+		ErrLine:      errLine,
 	}
 }
 

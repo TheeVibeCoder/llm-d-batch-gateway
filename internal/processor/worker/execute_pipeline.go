@@ -106,7 +106,7 @@ func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionPar
 	)
 	tracker.AddFailed(modelMap.RejectedCount)
 
-	source := NewPlanFileSource(PlanFileSourceConfig{
+	sourceCfg := PlanFileSourceConfig{
 		InputFile:          files.input,
 		PlansDir:           plansDir,
 		ModelMap:           modelMap,
@@ -116,32 +116,31 @@ func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionPar
 		SLODeadline:        sloDeadline,
 		TenantID:           params.jobInfo.TenantID,
 		Logger:             logger,
-	})
+		// Stable request IDs so dispatched IDs match the activation entry
+		// set across retries.
+		BatchID: params.jobInfo.JobID,
+	}
+	source := NewPlanFileSource(sourceCfg)
 
 	// The dispatcher forwards requests for processing.
 	pending := pipeline.NewPendingRequests(modelMap.LineCount)
-	dispatcher, err := p.buildRequestDispatcher(modelMap, pending, params.jobInfo.TenantID, logger)
+	dispatcher, err := p.buildRequestDispatcher(ctx, modelMap, pending, params, logger)
 	if err != nil {
 		return nil, fmt.Errorf("build dispatcher: %w", err)
 	}
 
-	// Collects the result and logs them.
-	resultCollector := pipeline.NewResultCollector(
-		files.output,
-		files.error,
-		pending,
-		tracker,
-		logger,
-	)
-
-	// Orchestrates Job execution.
-	executor := pipeline.NewJobExecutor(pipeline.JobExecutorConfig{
+	// Every result is checkpointed through the sink; finalization streams
+	// the artifacts from the entry set.
+	executorCfg := pipeline.JobExecutorConfig{
 		Source:     source,
 		Dispatcher: dispatcher,
-		Collector:  resultCollector,
 		Tracker:    tracker,
+		Collector:  pipeline.NewResultCheckpointer(params.resultSink, pending, tracker, logger),
 		Logger:     logger,
-	})
+	}
+
+	// Orchestrates Job execution.
+	executor := pipeline.NewJobExecutor(executorCfg)
 
 	// Finally, start and wait for completion.
 	counts, execErr := executor.Execute(ctx)
@@ -169,52 +168,46 @@ func classifyOutcome(cause error, counts *openai.BatchRequestCounts, execErr err
 	return execErr
 }
 
-func (p *Processor) buildRequestDispatcher(modelMap *modelMapFile, pending *pipeline.PendingRequests, tenantID string, logger logr.Logger) (pipeline.RequestDispatcher, error) {
-	switch {
-	case p.asyncInference != nil:
+func (p *Processor) buildRequestDispatcher(ctx context.Context, modelMap *modelMapFile, pending *pipeline.PendingRequests, params *jobExecutionParams, logger logr.Logger) (pipeline.RequestDispatcher, error) {
+	// Fence each request into in_flight before dispatch so a zombie
+	// incarnation stops at its next submit instead of streaming the
+	// remaining requests into inference.
+	fence := p.markEntryInFlightHook(ctx, params)
+
+	if p.asyncInference != nil {
 		broadcasters := p.broadcasters.forModels(modelMap)
 		async := pipeline.NewAsyncDispatcher(p.asyncInference, broadcasters, pending, logger)
-		return pipeline.NewPreDispatcher(async), nil
-	case p.cfg.Concurrency.AIMD.Enabled:
-		models := buildAIMDModels(modelMap, p.inference, p.endpointLimits, p.cfg.RouteKeyMethod, tenantID)
-		direct := pipeline.NewDirectDispatcher(p.inference, logger)
-		aimd, err := pipeline.NewAIMDDispatcher(direct, models, p.cfg.Concurrency.Global, logger)
-		if err != nil {
-			return nil, err
-		}
-		return pipeline.NewPreDispatcher(aimd), nil
-	default:
-		// AIMD is used even when adaptive limits are disabled: with AIMD.Enabled=false,
-		// EndpointAIMD.AIMD is nil so recordAIMDSignal is a no-op, but the semaphores
-		// still enforce fixed concurrency limits (global + per-endpoint). Without this,
-		// DirectDispatcher would dispatch all requests as unbounded goroutines.
-		models := buildAIMDModels(modelMap, p.inference, p.endpointLimits, p.cfg.RouteKeyMethod, tenantID)
-		direct := pipeline.NewDirectDispatcher(p.inference, logger)
-		aimd, err := pipeline.NewAIMDDispatcher(direct, models, p.cfg.Concurrency.Global, logger)
-		if err != nil {
-			return nil, err
-		}
-		return pipeline.NewPreDispatcher(aimd), nil
+		return pipeline.NewPreDispatcher(async).WithBeforeSubmit(fence), nil
 	}
+
+	// AIMD is used even when adaptive limits are disabled: with AIMD.Enabled=false,
+	// EndpointAIMD.AIMD is nil so recordAIMDSignal is a no-op, but the semaphores
+	// still enforce fixed concurrency limits (global + per-endpoint). Without this,
+	// DirectDispatcher would dispatch all requests as unbounded goroutines.
+	models := buildAIMDModels(modelMap, p.inference, p.endpointLimits, p.cfg.RouteKeyMethod, params.jobInfo.TenantID)
+	direct := pipeline.NewDirectDispatcher(p.inference, logger)
+	aimd, err := pipeline.NewAIMDDispatcher(direct, models, p.cfg.Concurrency.Global, logger)
+	if err != nil {
+		return nil, err
+	}
+	return pipeline.NewPreDispatcher(aimd).WithBeforeSubmit(fence), nil
 }
 
 type dataFiles struct {
-	input, output, error *os.File
+	input *os.File
 }
 
 func (f *dataFiles) close() {
-	for _, file := range []*os.File{f.input, f.output, f.error} {
-		if file != nil {
-			_ = file.Close()
-		}
+	if f.input != nil {
+		_ = f.input.Close()
 	}
 }
 
+// openDataFiles opens the preprocessed input file. Results are checkpointed
+// to the result store and finalization streams the artifacts from there —
+// no local output files are kept.
 func (p *Processor) openDataFiles(params *jobExecutionParams) (*dataFiles, error) {
-	jobID := params.jobInfo.JobID
-	tenantID := params.jobInfo.TenantID
-
-	inputPath, err := p.jobInputFilePath(jobID, tenantID)
+	inputPath, err := p.jobInputFilePath(params.jobInfo.JobID, params.jobInfo.TenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -222,32 +215,7 @@ func (p *Processor) openDataFiles(params *jobExecutionParams) (*dataFiles, error
 	if err != nil {
 		return nil, fmt.Errorf("open input file: %w", err)
 	}
-
-	outputPath, err := p.jobOutputFilePath(jobID, tenantID)
-	if err != nil {
-		inputFile.Close()
-		return nil, err
-	}
-	outputFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		inputFile.Close()
-		return nil, fmt.Errorf("create output file: %w", err)
-	}
-
-	errorPath, err := p.jobErrorFilePath(jobID, tenantID)
-	if err != nil {
-		inputFile.Close()
-		outputFile.Close()
-		return nil, err
-	}
-	errorFile, err := os.OpenFile(errorPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		inputFile.Close()
-		outputFile.Close()
-		return nil, fmt.Errorf("create error file: %w", err)
-	}
-
-	return &dataFiles{input: inputFile, output: outputFile, error: errorFile}, nil
+	return &dataFiles{input: inputFile}, nil
 }
 
 // buildAIMDModels keys per-endpoint concurrency state by route key: dispatch

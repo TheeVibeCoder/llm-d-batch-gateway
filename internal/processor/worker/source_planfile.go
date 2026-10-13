@@ -30,6 +30,7 @@ type PlanFileSource struct {
 	passThroughHeaders map[string]string
 	sloDeadline        time.Time
 	tenantID           string
+	batchID            string
 	logger             logr.Logger
 }
 
@@ -44,7 +45,12 @@ type PlanFileSourceConfig struct {
 	PassThroughHeaders map[string]string
 	SLODeadline        time.Time
 	TenantID           string
-	Logger             logr.Logger
+	// BatchID, when set, derives stable request IDs so the durable
+	// pipeline's dispatched IDs match the activation entry set across
+	// retries. The legacy pipeline leaves it empty and keeps per-run
+	// random IDs.
+	BatchID string
+	Logger  logr.Logger
 }
 
 func NewPlanFileSource(cfg PlanFileSourceConfig) *PlanFileSource {
@@ -57,6 +63,7 @@ func NewPlanFileSource(cfg PlanFileSourceConfig) *PlanFileSource {
 		passThroughHeaders: cfg.PassThroughHeaders,
 		sloDeadline:        cfg.SLODeadline,
 		tenantID:           cfg.TenantID,
+		batchID:            cfg.BatchID,
 		logger:             cfg.Logger,
 	}
 }
@@ -108,6 +115,11 @@ func (s *PlanFileSource) readEntry(entry planEntry, modelID string) (*pipeline.R
 		}, nil
 	}
 
+	requestID := newBatchRequestID(uuid.NewString())
+	if s.batchID != "" {
+		requestID = stableBatchRequestID(s.batchID, req.CustomID)
+	}
+
 	// When route_key_method is "tenant", scope the gateway lookup key by
 	// tenant so identically-named models of different tenants route to their
 	// own backends (model_gateways entries keyed "<tenantID>/<modelID>").
@@ -118,7 +130,7 @@ func (s *PlanFileSource) readEntry(entry planEntry, modelID string) (*pipeline.R
 	headers = s.mergeHeaders(headers, lookupID)
 
 	return &pipeline.RequestItem{
-		RequestID: fmt.Sprintf("batch_req_%s", uuid.NewString()),
+		RequestID: requestID,
 		CustomID:  req.CustomID,
 		ModelID:   lookupID,
 		Endpoint:  req.URL,
