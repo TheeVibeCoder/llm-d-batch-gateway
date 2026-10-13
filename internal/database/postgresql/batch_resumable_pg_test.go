@@ -31,6 +31,7 @@ import (
 // resumablePgEnv bundles the real clients and pool the pg-backed tests use.
 type resumablePgEnv struct {
 	ctx     context.Context
+	url     string
 	store   *PostgresResumableStore
 	batchDB *PostgresBatchDBClient
 	queue   *PostgresBatchQueueClient
@@ -47,7 +48,7 @@ func newResumablePgEnv(t *testing.T) *resumablePgEnv {
 	ctx := context.Background()
 
 	cfg := &PostgreSQLConfig{Url: url}
-	env := &resumablePgEnv{ctx: ctx}
+	env := &resumablePgEnv{ctx: ctx, url: url}
 	var err error
 	if env.store, err = NewPostgresResumableStore(ctx, cfg); err != nil {
 		t.Fatalf("NewPostgresResumableStore: %v", err)

@@ -281,7 +281,13 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 
 		// check queue for available tasks
 		logger.V(logging.DEBUG).Info("Checking queue for available tasks")
-		task, err := p.poller.dequeueOne(pollingCtx)
+		// The resumable lease rides the dequeue: only durable (async) processors
+		// offer one, so a sync-mode processor never claims a requeued resumable row.
+		var resumableLease time.Duration
+		if p.executeDurable() {
+			resumableLease = p.cfg.Resumable.LeaseDuration
+		}
+		task, err := p.poller.dequeueOne(pollingCtx, resumableLease)
 
 		// when there's no waiting tasks in the queue or poller returned an error
 		if task == nil || err != nil {
@@ -350,7 +356,20 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 
 		pollLogger.V(logging.TRACE).Info("Job info object converted")
 
-		if batch_utils.IsJobExpired(task) {
+		// A requeued resumable row is claimed mid-flight (non-terminal, typically
+		// in_progress): the fresh-row expiry and runnable checks do not apply,
+		// and the resume path in runJob owns the terminal routing (cancelling,
+		// SLO-expired, recovery attempts exhausted). A processor without the
+		// durable pipeline cannot resume — the dequeue only offers a lease on
+		// such processors, so this guard is defense in depth.
+		if task.Resumable {
+			if !p.executeDurable() || p.resumable == nil {
+				pollLogger.Error(fmt.Errorf("resumable job claimed by a processor without the durable pipeline"), "Skipping job")
+				p.releaseForNextPoll()
+				metrics.RecordJobProcessed(metrics.ResultSkipped, metrics.ReasonNotRunnableState)
+				continue
+			}
+		} else if batch_utils.IsJobExpired(task) {
 			pollLogger.V(logging.INFO).Info("Job is expired.")
 
 			if err := p.updater.UpdatePersistentStatus(pollCtx, jobItem, openai.BatchStatusExpired, nil, nil); err != nil {
@@ -365,10 +384,7 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 			recordE2ELatency(jobInfo, metrics.E2EStatusExpired)
 			metrics.RecordJobProcessed(metrics.ResultExpired, metrics.ReasonExpiredDequeue)
 			continue
-		}
-
-		// job is not in runnable state.
-		if !batch_utils.IsJobRunnable(jobInfo.BatchJob) {
+		} else if !batch_utils.IsJobRunnable(jobInfo.BatchJob) {
 			if jobInfo.BatchJob.Status == openai.BatchStatusCancelling {
 				pollLogger.V(logging.INFO).Info("Job is in cancelling state after dequeue, transitioning to cancelled")
 				if err := p.updater.UpdateCancelledStatus(pollCtx, jobItem, nil, "", ""); err != nil {
@@ -401,6 +417,18 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 			p.releaseForNextPoll()
 			bgCtx, bgSpan := uotel.DetachedContext(pollCtx, "re-enqueue-guard")
 			defer bgSpan.End()
+			if task.Resumable {
+				// The legacy re-enqueue refuses resumable rows; the fenced
+				// requeue returns the batch to the queue directly. Failure
+				// leaves the lease to lapse and the reconciler to requeue.
+				if err := p.resumable.RequeueResumableOrphan(bgCtx, task.ID, p.processorID, task.Epoch, false); err != nil {
+					pollLogger.Error(err, "Failed to requeue resumable job during graceful shutdown")
+					metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonGuardShutdown)
+				} else {
+					metrics.RecordJobProcessed(metrics.ResultReEnqueued, metrics.ReasonGuardShutdown)
+				}
+				return nil
+			}
 			if reEnqueueErr := p.poller.enqueueOne(bgCtx, task); reEnqueueErr != nil {
 				pollLogger.Error(reEnqueueErr, "Failed to re-enqueue job during graceful shutdown, marking as failed")
 				if failErr := p.handleFailed(bgCtx, p.updater, jobItem, nil, jobInfo); failErr != nil {

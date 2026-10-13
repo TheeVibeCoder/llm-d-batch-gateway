@@ -49,6 +49,7 @@ type durableJobEnv struct {
 	fileDB      db.FileDBClient
 	filesClient *mockfiles.MockBatchFilesClient
 	resumable   *mockdb.MockResumableStore
+	pqClient    *mockdb.MockBatchPriorityQueueClient
 	asyncClient *fakeAsyncInferenceClient
 	jobItem     *db.BatchItem
 	jobInfo     *batch_types.JobInfo
@@ -173,6 +174,7 @@ func setupDurableJob(t *testing.T, jobID string, models []string) *durableJobEnv
 		fileDB:      fileDBClient,
 		filesClient: mockfiles.NewMockBatchFilesClient(filesRoot),
 		resumable:   resumable,
+		pqClient:    pqClient,
 		asyncClient: asyncClient,
 		jobItem:     jobItem,
 		jobInfo:     jobInfo,
@@ -355,6 +357,162 @@ func TestRunJob_Resumable_ActivationConflict_LeavesJobValidating(t *testing.T) {
 	if state.Pending+state.InFlight+state.Completed+state.Failed != 0 {
 		t.Fatalf("entries inserted despite activation conflict: %+v", state)
 	}
+}
+
+// TestRunPollingLoop_ResumableRouting covers the polling loop's handling of a
+// claimed requeued resumable task (task.Resumable): terminal routing is
+// deferred to the resume path in runJob, a processor without the durable
+// pipeline skips it fail-closed, and the shutdown guard requeues it through
+// the resumable store instead of the legacy enqueue.
+func TestRunPollingLoop_ResumableRouting(t *testing.T) {
+	t.Run("sync processor skips the task without a terminal write", func(t *testing.T) {
+		ctx := testLoggerCtx(t)
+
+		cfg := config.NewConfig()
+		cfg.PollInterval = 5 * time.Millisecond
+		cfg.NumWorkers = 1
+
+		pq := &spyPQ{inner: mockdb.NewMockBatchPriorityQueueClient()}
+		dbClient := newSpyBatchDB(newMockBatchDBClient())
+		jobID := "job-resumable-sync-skip"
+
+		jobItem := &db.BatchItem{
+			BaseIndexes: db.BaseIndexes{
+				ID:       jobID,
+				TenantID: "tenantA",
+				Tags:     db.Tags{"tenant": "tenantA"},
+			},
+			BaseContents: db.BaseContents{
+				Spec:   mustJSON(t, openai.BatchSpec{InputFileID: "unused"}),
+				Status: mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress}),
+			},
+		}
+		if err := dbClient.DBStore(ctx, jobItem); err != nil {
+			t.Fatalf("DBStore job item: %v", err)
+		}
+		if err := pq.PQEnqueue(ctx, &db.BatchJobPriority{
+			ID:        jobID,
+			SLO:       time.Now().Add(-1 * time.Second),
+			Resumable: true,
+		}); err != nil {
+			t.Fatalf("PQEnqueue task: %v", err)
+		}
+
+		p := mustNewProcessor(t, cfg, &clientset.Clientset{BatchDB: dbClient, Queue: pq})
+
+		runCtx, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+		defer cancel()
+		if err := p.runPollingLoop(runCtx, runCtx); err != nil {
+			t.Fatalf("runPollingLoop: %v", err)
+		}
+
+		// Fail-closed: the lapsed SLO must not expire the batch and the
+		// in-memory task is dropped, not re-enqueued.
+		if calls := dbClient.StatusCalls(openai.BatchStatusExpired); calls != 0 {
+			t.Fatalf("sync processor wrote expired status %d times for a resumable task", calls)
+		}
+		assertJobStatus(t, dbClient, jobID, openai.BatchStatusInProgress)
+		if calls := pq.EnqueueCalls(); calls != 1 {
+			t.Fatalf("enqueue calls = %d, want only the seed", calls)
+		}
+	})
+
+	t.Run("durable processor defers terminal routing to runJob", func(t *testing.T) {
+		const jobID = "job-resumable-poll-route"
+		ctx := testLoggerCtx(t)
+
+		env := setupDurableJob(t, jobID, []string{"test-model"})
+
+		// A requeued cancelling row: without routing, the poll loop would
+		// transition it to cancelled itself. Fence this processor out of the
+		// activation so runJob aborts via handleOwnershipLost — the new owner
+		// owns the terminal transition, so no status may be written at all.
+		env.jobItem.Spec = mustJSON(t, openai.BatchSpec{
+			InputFileID: "file-input-" + jobID,
+			Endpoint:    openai.EndpointChatCompletions,
+		})
+		env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusCancelling})
+		if err := env.dbClient.DBStore(ctx, env.jobItem); err != nil {
+			t.Fatalf("DBStore job item: %v", err)
+		}
+		env.resumable.SeedBatch(jobID, "test-processor", 42)
+
+		if err := env.pqClient.PQEnqueue(ctx, &db.BatchJobPriority{
+			ID:        jobID,
+			SLO:       time.Now().Add(1 * time.Hour),
+			Epoch:     2,
+			Resumable: true,
+		}); err != nil {
+			t.Fatalf("PQEnqueue task: %v", err)
+		}
+
+		runCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel()
+		if err := env.p.runPollingLoop(runCtx, runCtx); err != nil {
+			t.Fatalf("runPollingLoop: %v", err)
+		}
+		env.p.wg.Wait()
+
+		assertJobStatus(t, env.dbClient, jobID, openai.BatchStatusCancelling)
+	})
+
+	t.Run("shutdown guard requeues through the resumable store", func(t *testing.T) {
+		const jobID = "job-resumable-poll-shutdown"
+		ctx := testLoggerCtx(t)
+
+		env := setupDurableJob(t, jobID, []string{"test-model"})
+
+		// Put the mock batch in the activated state a requeued claim implies.
+		// The Spec only needs to parse: runJob is never launched.
+		env.jobItem.Spec = mustJSON(t, openai.BatchSpec{InputFileID: "unused"})
+		env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress})
+		if err := env.dbClient.DBStore(ctx, env.jobItem); err != nil {
+			t.Fatalf("DBStore job item: %v", err)
+		}
+		err := env.resumable.ActivateResumableBatch(ctx, &db.ResumableActivation{
+			BatchID:     jobID,
+			ProcessorID: "test-processor",
+			Epoch:       1,
+			LeaseTTL:    time.Minute,
+			Entries: []db.ResumableActivationEntry{
+				{RequestID: "r-1", Ordinal: 0, CustomID: "c-1", Status: string(db.ResumableEntryPending)},
+			},
+		})
+		if err != nil {
+			t.Fatalf("ActivateResumableBatch: %v", err)
+		}
+
+		// Cancel the polling context right after the claim: the pre-launch
+		// guard fires with the task in hand.
+		runCtx, cancel := context.WithCancel(ctx)
+		pq := &spyPQ{inner: env.pqClient, afterDequeueFn: cancel}
+		env.p.poller = NewPoller(pq, env.dbClient)
+
+		if err := pq.PQEnqueue(ctx, &db.BatchJobPriority{
+			ID:        jobID,
+			SLO:       time.Now().Add(1 * time.Hour),
+			Epoch:     1,
+			Resumable: true,
+		}); err != nil {
+			t.Fatalf("PQEnqueue task: %v", err)
+		}
+
+		if err := env.p.runPollingLoop(runCtx, runCtx); err != nil {
+			t.Fatalf("runPollingLoop: %v", err)
+		}
+
+		// The batch is back in the queue via the fenced requeue: ownership
+		// released, epoch bumped, one recovery attempt — and no terminal
+		// write or legacy re-enqueue.
+		owner, epoch, attempts := env.resumable.BatchOwnership(jobID)
+		if owner != "" || epoch != 2 || attempts != 1 {
+			t.Fatalf("ownership after shutdown requeue = (%q, %d, %d), want released at epoch 2 with 1 attempt", owner, epoch, attempts)
+		}
+		assertJobStatus(t, env.dbClient, jobID, openai.BatchStatusInProgress)
+		if calls := pq.EnqueueCalls(); calls != 1 {
+			t.Fatalf("enqueue calls = %d, want only the seed (legacy re-enqueue must be skipped)", calls)
+		}
+	})
 }
 
 func TestRenewBatchLease(t *testing.T) {
