@@ -145,12 +145,6 @@ func (c *ResultCheckpointer) record(msg ResultItem) {
 		}
 		return
 	}
-	code := "unknown"
-	if msg.Error != nil {
-		code = msg.Error.Code
-	} else if msg.Response != nil {
-		code = fmt.Sprintf("http_%d", msg.Response.StatusCode)
-	}
-	c.tracker.RecordFailure(fmt.Errorf("%s: %s", msg.RequestID, code))
+	c.tracker.RecordFailure(fmt.Errorf("%s: %s", msg.RequestID, msg.ErrorCode()))
 	metrics.RecordRequestError(msg.ModelID)
 }

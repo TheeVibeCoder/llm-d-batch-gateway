@@ -53,17 +53,23 @@ func (m *MockBatchFilesClient) Store(ctx context.Context, fileName, folderName s
 		return nil, fmt.Errorf("%w: %s", api.ErrFileExists, location)
 	}
 
-	fullDir := filepath.Join(rootDir, folderName)
+	fullDir := filepath.Dir(filePath)
 	if err := os.MkdirAll(fullDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// create and write file
-	file, err := os.Create(filePath)
+	// Write to a temp file and rename it into place as the last operation:
+	// like the fs and S3 clients, an object only becomes visible once fully
+	// written, so a concurrent duplicate never observes partial content.
+	tmp, err := os.CreateTemp(fullDir, ".store-*")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create file: %w", err)
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
-	defer file.Close()
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
 
 	var totalBytes int64
 	var lineCount int64
@@ -76,17 +82,14 @@ func (m *MockBatchFilesClient) Store(ctx context.Context, fileName, folderName s
 		lineLen := int64(len(line))
 
 		if fileSizeLimit > 0 && totalBytes+lineLen+1 > fileSizeLimit {
-			_ = os.Remove(filePath)
 			return nil, fmt.Errorf("file size exceeds limit of %d bytes", fileSizeLimit)
 		}
 
 		// write line to file
-		if _, err := file.Write(line); err != nil {
-			_ = os.Remove(filePath)
+		if _, err := tmp.Write(line); err != nil {
 			return nil, fmt.Errorf("failed to write file: %w", err)
 		}
-		if _, err := file.Write([]byte("\n")); err != nil {
-			_ = os.Remove(filePath)
+		if _, err := tmp.Write([]byte("\n")); err != nil {
 			return nil, fmt.Errorf("failed to write file: %w", err)
 		}
 
@@ -95,20 +98,23 @@ func (m *MockBatchFilesClient) Store(ctx context.Context, fileName, folderName s
 
 		// check line count limit
 		if lineNumLimit > 0 && lineCount > lineNumLimit {
-			_ = os.Remove(filePath)
 			return nil, fmt.Errorf("file line count exceeds limit of %d lines", lineNumLimit)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		_ = os.Remove(filePath)
 		return nil, fmt.Errorf("failed to read input: %w", err)
 	}
 
 	// construct file metadata
-	fileInfo, err := file.Stat()
+	fileInfo, err := tmp.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	// Rename temp file to final destination as the last operation.
+	if err := os.Rename(tmpName, filePath); err != nil {
+		return nil, fmt.Errorf("failed to store file: %w", err)
 	}
 
 	// Return relative location (relative to rootDir)
@@ -152,12 +158,12 @@ func (w *mockStreamWriter) Write(p []byte) (int, error) {
 }
 
 func (w *mockStreamWriter) Commit(ctx context.Context) (*api.BatchFileMetadata, error) {
-	fullDir := filepath.Join(w.rootDir, w.folderName)
+	filePath := filepath.Join(w.rootDir, w.folderName, w.fileName)
+	fullDir := filepath.Dir(filePath)
 	if err := os.MkdirAll(fullDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	filePath := filepath.Join(fullDir, w.fileName)
 	file, err := os.Create(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create file: %w", err)

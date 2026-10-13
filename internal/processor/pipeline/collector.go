@@ -32,6 +32,18 @@ func (r *ResultItem) Succeeded() bool {
 	return r.Error == nil && r.Response != nil && r.Response.StatusCode == 200
 }
 
+// ErrorCode classifies a non-success result for error reporting: the output
+// error's code when present, otherwise the HTTP status.
+func (r *ResultItem) ErrorCode() string {
+	if r.Error != nil {
+		return r.Error.Code
+	}
+	if r.Response != nil {
+		return fmt.Sprintf("http_%d", r.Response.StatusCode)
+	}
+	return "unknown"
+}
+
 // MarshalResultLine renders one result as an output JSONL line (with its
 // trailing newline) and returns the line bytes, its SHA-256 hex digest, and
 // its size in bytes — the metadata the durable pipeline checkpoints per entry.
@@ -130,13 +142,7 @@ func (c *ResultCollector) Receive(msg ResultItem) error {
 			recordTokenUsage(msg.Response.Body, msg.ModelID, c.logger)
 		}
 	} else {
-		code := "unknown"
-		if msg.Error != nil {
-			code = msg.Error.Code
-		} else if msg.Response != nil {
-			code = fmt.Sprintf("http_%d", msg.Response.StatusCode)
-		}
-		c.tracker.RecordFailure(fmt.Errorf("%s: %s", msg.RequestID, code))
+		c.tracker.RecordFailure(fmt.Errorf("%s: %s", msg.RequestID, msg.ErrorCode()))
 		metrics.RecordRequestError(msg.ModelID)
 	}
 

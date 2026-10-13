@@ -59,7 +59,10 @@ type ResumableEntry struct {
 	ResultKey    string
 	ResultBytes  int64
 	ResultSHA256 string
-	ErrorCode    string
+	// ErrorCode is the code of the entry's error-object line; empty for a
+	// failed entry whose line preserves a non-2xx HTTP response (an output
+	// line, like the sync pipeline's routing).
+	ErrorCode string
 }
 
 // ResumableActivationEntry is one entry of the activation set derived from the

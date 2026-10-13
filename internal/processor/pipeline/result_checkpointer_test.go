@@ -26,9 +26,9 @@ type checkpointRecord struct {
 // fakeSink records every checkpoint. fn, when set, decides the outcome
 // instead of the default commit; records are kept only for committed ones.
 type fakeSink struct {
-	mu     sync.Mutex
+	mu      sync.Mutex
 	records []checkpointRecord
-	fn     func(msg *ResultItem) (bool, error)
+	fn      func(msg *ResultItem) (bool, error)
 }
 
 var _ ResultSink = (*fakeSink)(nil)

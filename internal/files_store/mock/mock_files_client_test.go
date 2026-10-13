@@ -57,6 +57,27 @@ func TestStore(t *testing.T) {
 		}
 	})
 
+	t.Run("creates the key's parent directories", func(t *testing.T) {
+		client := newTestClient(t)
+		content := []byte("line1\n")
+
+		md, err := client.Store(ctx, "results/batch-1/req-1.jsonl", "folder", 0, 0, bytes.NewReader(content))
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if md.Location != filepath.Join("folder", "results", "batch-1", "req-1.jsonl") {
+			t.Errorf("unexpected location %s", md.Location)
+		}
+
+		data, err := os.ReadFile(filepath.Join(client.rootDir, "folder", "results", "batch-1", "req-1.jsonl"))
+		if err != nil {
+			t.Fatalf("failed to read stored file: %v", err)
+		}
+		if !bytes.Equal(data, content) {
+			t.Errorf("expected content %q, got %q", content, data)
+		}
+	})
+
 	t.Run("returns ErrFileExists for stored file", func(t *testing.T) {
 		client := newTestClient(t)
 		content := []byte("line1\n")

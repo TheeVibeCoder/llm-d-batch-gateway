@@ -170,3 +170,37 @@ func TestPreProcess_ManifestDeterministic(t *testing.T) {
 		t.Fatalf("manifests differ across runs:\n%+v\n%+v", first.Entries, second.Entries)
 	}
 }
+
+func TestManifest_ActivationEntries(t *testing.T) {
+	manifest, _ := runPreProcessOnce(t, "job-manifest")
+
+	entries := manifest.activationEntries()
+	if len(entries) != len(manifest.Entries) {
+		t.Fatalf("activation entries = %d, want %d", len(entries), len(manifest.Entries))
+	}
+
+	for i, e := range entries {
+		if e.RequestID != manifest.Entries[i].RequestID ||
+			e.Ordinal != manifest.Entries[i].Ordinal ||
+			e.CustomID != manifest.Entries[i].CustomID {
+			t.Fatalf("entry %d does not mirror the manifest: %+v", i, e)
+		}
+	}
+
+	accepted, rejected := entries[0], entries[1]
+	if accepted.Status != string(db.ResumableEntryPending) {
+		t.Fatalf("accepted entry activates as %q, want pending", accepted.Status)
+	}
+	if accepted.ErrorCode != "" || accepted.ResultKey != "" || accepted.ResultBytes != 0 || accepted.ResultSHA256 != "" {
+		t.Fatalf("pending entry carries result metadata: %+v", accepted)
+	}
+
+	src := manifest.Entries[1]
+	if rejected.Status != string(db.ResumableEntryFailed) {
+		t.Fatalf("rejected entry activates as %q, want failed", rejected.Status)
+	}
+	if rejected.ErrorCode != src.ErrorCode || rejected.ResultKey != src.ResultKey ||
+		rejected.ResultBytes != src.ResultBytes || rejected.ResultSHA256 != src.ResultSHA256 {
+		t.Fatalf("rejected entry = %+v, want the manifest metadata %+v", rejected, src)
+	}
+}

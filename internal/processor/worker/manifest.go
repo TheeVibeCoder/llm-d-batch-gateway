@@ -20,6 +20,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+
+	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 )
 
 // manifestEntry is the per-line metadata accumulated while preprocessing a
@@ -61,6 +63,30 @@ func rejectedEntry(batchID string, ordinal int64, customID, requestID, errorCode
 		ResultBytes:  int64(len(errLine)),
 		ResultSHA256: hex.EncodeToString(sum[:]),
 	}
+}
+
+// activationEntries converts the manifest into the entry set for resumable
+// activation: accepted lines activate as pending, rejected lines as failed
+// with the metadata of the error object ingestion wrote for them.
+func (m *requestManifest) activationEntries() []db.ResumableActivationEntry {
+	entries := make([]db.ResumableActivationEntry, len(m.Entries))
+	for i, e := range m.Entries {
+		entry := db.ResumableActivationEntry{
+			RequestID: e.RequestID,
+			Ordinal:   e.Ordinal,
+			CustomID:  e.CustomID,
+			Status:    string(db.ResumableEntryPending),
+		}
+		if e.Rejected {
+			entry.Status = string(db.ResumableEntryFailed)
+			entry.ErrorCode = e.ErrorCode
+			entry.ResultKey = e.ResultKey
+			entry.ResultBytes = e.ResultBytes
+			entry.ResultSHA256 = e.ResultSHA256
+		}
+		entries[i] = entry
+	}
+	return entries
 }
 
 // resumableResultKey is the file-store key of one request's result object.
