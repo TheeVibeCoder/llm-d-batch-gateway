@@ -86,6 +86,19 @@ func (m *MockResumableStore) MarkTerminal(batchID string) {
 	}
 }
 
+// BatchOwnership exposes a seeded batch's ownership state for test
+// assertions: the processor ID (empty once requeued), epoch, and recovery
+// attempt count.
+func (m *MockResumableStore) BatchOwnership(batchID string) (processorID string, epoch, recoveryAttempts int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.batches[batchID]
+	if !ok {
+		return "", 0, 0
+	}
+	return b.processorID, b.epoch, b.recoveryAttempts
+}
+
 func (m *MockResumableStore) Close() error {
 	return nil
 }
