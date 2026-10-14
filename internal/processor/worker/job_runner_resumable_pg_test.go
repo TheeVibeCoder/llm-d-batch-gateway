@@ -225,6 +225,11 @@ func TestRunJob_Resumable_RequeueClaimResume(t *testing.T) {
 	if status.RequestCounts != wantCounts {
 		t.Fatalf("counts = %+v, want %+v", status.RequestCounts, wantCounts)
 	}
+	// The terminal document must carry the activation's in_progress_at —
+	// building it from a stale in-memory status drops the timestamp.
+	if status.InProgressAt == nil || *status.InProgressAt == 0 {
+		t.Fatalf("in_progress_at = %v, want the activation timestamp", status.InProgressAt)
+	}
 
 	// The checkpointed entry was not re-submitted.
 	if got := env.asyncClient.submitCount(); got != 1 {
@@ -259,5 +264,144 @@ func TestRunJob_Resumable_RequeueClaimResume(t *testing.T) {
 		if text, ok := choices[0].(map[string]any)["text"]; !ok || text != wantText {
 			t.Fatalf("output line %d choice text = %v, want %q", i, text, wantText)
 		}
+	}
+}
+
+// TestRunJob_Resumable_FreshActivationKeepsInProgressAt verifies the fresh
+// activation path against real Postgres: the activation CTE writes
+// in_progress (and its timestamp) in the row, and the terminal document must
+// carry that timestamp — building it from the stale in-memory validating
+// status silently drops it.
+func TestRunJob_Resumable_FreshActivationKeepsInProgressAt(t *testing.T) {
+	url := os.Getenv("TEST_POSTGRES_URL")
+	if url == "" {
+		t.Skip("TEST_POSTGRES_URL not set")
+	}
+	ctx := testLoggerCtx(t)
+	const processorID = "processor-fresh-pg"
+	const jobID = "job-resumable-pg-fresh"
+	const tenantID = "tenant-1"
+	inputFileID := "file-input-" + jobID
+
+	filesRoot, fileDBClient := seedDurableInput(t, tenantID, inputFileID, []string{"test-model"})
+
+	cfg := &postgresql.PostgreSQLConfig{Url: url}
+	batchDB, err := postgresql.NewPostgresBatchDBClient(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewPostgresBatchDBClient: %v", err)
+	}
+	t.Cleanup(func() { _ = batchDB.Close() })
+	queue, err := postgresql.NewPostgresBatchQueueClient(ctx, cfg, processorID)
+	if err != nil {
+		t.Fatalf("NewPostgresBatchQueueClient: %v", err)
+	}
+	t.Cleanup(func() { _ = queue.Close() })
+	resumable, err := postgresql.NewPostgresResumableStore(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewPostgresResumableStore: %v", err)
+	}
+	t.Cleanup(func() { _ = resumable.Close() })
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, "TRUNCATE batch_items CASCADE"); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	// A fresh validating row, as the unified dequeue delivers it — the
+	// in-memory status the run starts from.
+	if err := batchDB.DBStore(ctx, &db.BatchItem{
+		BaseIndexes: db.BaseIndexes{ID: jobID, TenantID: tenantID},
+		BaseContents: db.BaseContents{
+			Status: mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusValidating}),
+			Spec:   mustJSON(t, openai.BatchSpec{InputFileID: inputFileID, Endpoint: openai.EndpointChatCompletions}),
+		},
+		ProcessorID: processorID,
+		Priority:    time.Now().Add(1 * time.Hour).UnixMicro(),
+		Epoch:       1,
+	}); err != nil {
+		t.Fatalf("seed batch item: %v", err)
+	}
+
+	filesClient := mockfiles.NewMockBatchFilesClient(filesRoot)
+	asyncClient := &fakeAsyncInferenceClient{
+		submittedCh: make(chan *inference.GenerateRequest),
+		results:     make(chan *inference.GenerateResponse, 64),
+	}
+	resolver := inference.NewTestAsyncResolver(map[string]func() inference.AsyncInferenceClient{
+		"test-model": func() inference.AsyncInferenceClient { return asyncClient },
+	})
+	pcfg := config.NewConfig()
+	pcfg.WorkDir = t.TempDir()
+	p := mustNewProcessorWithID(t, pcfg, &clientset.Clientset{
+		BatchDB:         batchDB,
+		BatchProgressDB: batchDB,
+		FileDB:          fileDBClient,
+		File:            filesClient,
+		Event:           mockdb.NewMockBatchEventChannelClient(),
+		Queue:           queue,
+		AsyncInference:  resolver,
+		Resumable:       resumable,
+	}, processorID)
+
+	bctx, bcancel := context.WithCancel(context.Background())
+	p.broadcasters = newBroadcasterRegistry(resolver, testLogger(t))
+	p.broadcasters.Run(bctx)
+	t.Cleanup(func() {
+		bcancel()
+		p.broadcasters.Wait()
+	})
+
+	jobItem, err := p.poller.fetchJobItemByID(ctx, jobID)
+	if err != nil {
+		t.Fatalf("fetchJobItemByID: %v", err)
+	}
+	jobInfo, err := batch_utils.FromDBItemToJobInfoObject(jobItem)
+	if err != nil {
+		t.Fatalf("FromDBItemToJobInfoObject: %v", err)
+	}
+	env := &durableJobEnv{
+		p:           p,
+		dbClient:    batchDB,
+		fileDB:      fileDBClient,
+		filesClient: filesClient,
+		asyncClient: asyncClient,
+		jobItem:     jobItem,
+		jobInfo:     jobInfo,
+	}
+
+	// A fresh (non-requeued) task: runJob activates through the real CTE.
+	done := env.runResumedJobAsync(t, &db.BatchJobPriority{
+		ID:    jobID,
+		SLO:   time.Now().Add(1 * time.Hour),
+		Epoch: 1,
+	})
+	go func() {
+		for {
+			select {
+			case req := <-env.asyncClient.submittedCh:
+				env.asyncClient.deliver(req.RequestID, map[string]any{"choices": []any{map[string]any{"text": "ok"}}})
+			case <-done:
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("runJob did not return after the fresh execution")
+	}
+
+	status := durableJobStatus(t, env)
+	if status.Status != openai.BatchStatusCompleted {
+		t.Fatalf("status = %s, want completed", status.Status)
+	}
+	if status.InProgressAt == nil || *status.InProgressAt == 0 {
+		t.Fatalf("in_progress_at = %v, want the activation timestamp", status.InProgressAt)
+	}
+	if status.CompletedAt != nil && *status.CompletedAt < *status.InProgressAt {
+		t.Fatalf("completed_at (%d) < in_progress_at (%d): the activation must not stamp into the future", status.CompletedAt, status.InProgressAt)
 	}
 }

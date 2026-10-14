@@ -125,7 +125,11 @@ func (c *PostgresResumableStore) ActivateResumableBatch(ctx context.Context, act
 			UPDATE batch_items
 			SET status = jsonb_set(
 					jsonb_set(status, '{status}', '"in_progress"'),
-					'{in_progress_at}', to_jsonb(EXTRACT(EPOCH FROM NOW())::bigint)),
+					-- FLOOR matches Go's time.Unix() truncation; a plain
+					-- numeric cast rounds to nearest, which can stamp
+					-- in_progress_at one second past a completed_at written
+					-- later in the same wall-clock second.
+					'{in_progress_at}', to_jsonb(FLOOR(EXTRACT(EPOCH FROM NOW()))::bigint)),
 				resumable = TRUE,
 				owner_lease_expires_at = NOW() + make_interval(secs => $5)
 			FROM candidate WHERE batch_items.id = candidate.id

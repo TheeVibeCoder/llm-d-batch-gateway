@@ -242,6 +242,12 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 	params.resultSink = sink
 	params.resumeSeed = seed
 	transitionedToInProgress = true
+	// The activation CTE writes in_progress (and its timestamp) directly in
+	// Postgres; refresh the in-memory status so later status documents build
+	// on the row's actual state instead of the stale validating JSON.
+	if fresh, ferr := p.poller.fetchJobItemByID(ctx, params.jobItem.ID); ferr == nil && fresh != nil {
+		params.jobItem.Status = fresh.Status
+	}
 	// Keep the ownership lease alive until runJob returns. Registered after
 	// the abortCause defer so it fires first on unwind (LIFO): the renewal
 	// goroutine stops before the neutral cause can trip it.
