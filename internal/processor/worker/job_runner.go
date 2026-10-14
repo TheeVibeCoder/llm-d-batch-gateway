@@ -224,7 +224,17 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 		logger.Error(err, "Failed to activate or resume resumable batch")
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "activation failed")
-		if failErr := p.handleFailed(ctx, params.updater, params.jobItem, nil, params.jobInfo); failErr != nil {
+		if params.task != nil && params.task.Resumable {
+			// A requeued batch already carries its checkpointed entry set:
+			// finalize through it (partial artifacts, entry counts) instead
+			// of the plain failed write, which would drop the artifacts and
+			// leave the resumable flag set on a terminal row.
+			if finErr := p.finalizeResumableAs(ctx, params.updater, params.jobItem, params.jobInfo,
+				openai.BatchStatusFailed, batch_types.ErrCodeBatchFailed,
+				p.getJobStatus(params.jobItem)); finErr != nil {
+				logger.Error(finErr, "Failed to finalize failed resumable pickup")
+			}
+		} else if failErr := p.handleFailed(ctx, params.updater, params.jobItem, nil, params.jobInfo); failErr != nil {
 			logger.Error(failErr, "Failed to handle failed event")
 		}
 		return
