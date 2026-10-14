@@ -181,8 +181,6 @@ func (p *Processor) finalizeResumableTerminal(
 	notExecutedCode batch_types.BatchErrorCode,
 	expected openai.BatchStatus,
 ) error {
-	logger := logr.FromContextOrDiscard(ctx)
-
 	err := p.finalizeResumableAs(ctx, params.updater, params.jobItem, params.jobInfo, status, notExecutedCode, expected)
 
 	// Cleanup after the terminal write: if it failed, the local files survive
@@ -198,7 +196,7 @@ func (p *Processor) finalizeResumableTerminal(
 			metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
 			return err
 		}
-		logger.Error(err, "Failed to terminalize resumable job; leaving it for the reconciler")
+		// Not logged here: every caller already logs the returned error.
 		return err
 	}
 
@@ -386,7 +384,10 @@ func (p *Processor) assembleResumableArtifacts(
 	}
 	errorFileID, err := errorW.commit(ctx, p, dbJob, jobInfo, jobErrorStorageName(jobID))
 	if err != nil {
-		return nil, "", "", err
+		// The output artifact may already be committed with a file record;
+		// surface the partial results so the failed-status fallback can
+		// reference them instead of dropping an uploaded artifact.
+		return counts, outputFileID, "", err
 	}
 	return counts, outputFileID, errorFileID, nil
 }
