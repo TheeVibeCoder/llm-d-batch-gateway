@@ -57,6 +57,13 @@ func (s *fakeSink) len() int {
 	return len(s.records)
 }
 
+// recorded returns a copy of the committed checkpoint records.
+func (s *fakeSink) recorded() []checkpointRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]checkpointRecord(nil), s.records...)
+}
+
 func successResult(id string) ResultItem {
 	return ResultItem{
 		RequestID: id,
@@ -261,4 +268,34 @@ func TestResultCheckpointer_Drain(t *testing.T) {
 			t.Fatalf("dispatch abort hook called %d times, want 1", hookCalls)
 		}
 	})
+}
+
+// sinkOutputBytes reconstructs the committed response-carrying result lines,
+// mirroring the bytes the legacy pipeline wrote to output.jsonl.
+func sinkOutputBytes(t *testing.T, sink *fakeSink) []byte {
+	t.Helper()
+	return sinkLines(t, sink, false)
+}
+
+// sinkErrorBytes reconstructs the committed error-object result lines,
+// mirroring the bytes the legacy pipeline wrote to error.jsonl.
+func sinkErrorBytes(t *testing.T, sink *fakeSink) []byte {
+	t.Helper()
+	return sinkLines(t, sink, true)
+}
+
+func sinkLines(t *testing.T, sink *fakeSink, wantErr bool) []byte {
+	t.Helper()
+	var buf []byte
+	for _, r := range sink.recorded() {
+		if (r.msg.Error != nil) != wantErr {
+			continue
+		}
+		line, _, _, err := MarshalResultLine(&r.msg)
+		if err != nil {
+			t.Fatalf("marshal result line: %v", err)
+		}
+		buf = append(buf, line...)
+	}
+	return buf
 }

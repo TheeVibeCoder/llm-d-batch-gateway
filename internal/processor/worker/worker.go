@@ -491,8 +491,5 @@ func (p *Processor) validate() error {
 	if p.inference != nil && p.asyncInference != nil {
 		return fmt.Errorf("sync and async inference clients are mutually exclusive")
 	}
-	if p.files == nil {
-		return fmt.Errorf("file manager is missing")
-	}
 	return p.files.validate()
 }

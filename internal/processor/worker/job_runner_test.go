@@ -607,7 +607,6 @@ func assertJobStatus(t *testing.T, dbClient db.BatchProgressDBClient, jobID stri
 	}
 }
 
-
 // TestHandleJobError_Shutdown_LeavesJobInProgress verifies that batchctx.ErrShutdown
 // does NOT re-enqueue or call handleFailed. The job stays in_progress for
 // the orphan reconciler to detect and transition to a terminal state.

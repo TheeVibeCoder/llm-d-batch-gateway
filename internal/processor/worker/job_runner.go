@@ -23,7 +23,6 @@ import (
 	"maps"
 	"runtime/debug"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -368,42 +367,6 @@ func (p *Processor) handleJobError(ctx context.Context, params *jobExecutionPara
 	}
 }
 
-// uploadPartialResults uploads whatever output/error files exist locally to shared storage.
-// Returns file IDs (empty string if the file was empty or upload failed).
-// Errors are logged but not propagated — partial upload is best-effort.
-// The two uploads are independent and run concurrently.
-func (p *Processor) uploadPartialResults(
-	ctx context.Context,
-	jobInfo *batch_types.JobInfo,
-	dbJob *db.BatchItem,
-) (outputFileID string, errorFileID string) {
-	logger := logr.FromContextOrDiscard(ctx)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		var err error
-		outputFileID, err = p.uploadFileAndStoreFileRecord(ctx, jobInfo, dbJob, metrics.FileTypeOutput)
-		if err != nil {
-			logger.Error(err, "Failed to upload output file (best-effort)")
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		var err error
-		errorFileID, err = p.uploadFileAndStoreFileRecord(ctx, jobInfo, dbJob, metrics.FileTypeError)
-		if err != nil {
-			logger.Error(err, "Failed to upload error file (best-effort)")
-		}
-	}()
-
-	wg.Wait()
-	return outputFileID, errorFileID
-}
-
 // handleExpired finalizes a job whose SLO deadline fired.
 // Three cases reach here:
 // (1) deadline expired during ingestion (preProcessJob) — no output files exist yet;
@@ -436,33 +399,27 @@ func (p *Processor) handleExpired(
 	logger := logr.FromContextOrDiscard(ctx)
 	logger.V(logging.INFO).Info("Job SLO expired, finalizing as expired")
 
-	outputFileID, errorFileID := p.uploadPartialResults(ioCtx, jobInfo, dbJob)
-
-	if err := updater.UpdateExpiredStatus(ioCtx, dbJob, requestCounts, outputFileID, errorFileID); err != nil {
+	if err := updater.UpdateExpiredStatus(ioCtx, dbJob, requestCounts, "", ""); err != nil {
 		logger.Error(err, "Failed to update status to expired")
 		return err
 	}
 
 	// Cleanup after terminal status write: if the write failed above, the local
-	// files survive for startup recovery to re-upload.
+	// artifacts survive for startup recovery to clean up.
 	p.cleanupJobArtifacts(ioCtx, dbJob.ID, dbJob.TenantID)
 
 	setRequestCountAttrs(ctx, requestCounts)
 
 	recordE2ELatency(jobInfo, metrics.E2EStatusExpired)
 	metrics.RecordJobProcessed(metrics.ResultExpired, metrics.ReasonExpiredExecution)
-	logger.V(logging.INFO).Info("Job expired handled", "outputFileID", outputFileID, "errorFileID", errorFileID)
+	logger.V(logging.INFO).Info("Job expired handled")
 	return nil
 }
 
-// handleFailed finalizes a failed job by optionally uploading partial results before
-// transitioning to failed status. When jobInfo is non-nil and partial output exists on
-// disk, the output and error files are uploaded so the user can retrieve whatever
-// completed before the failure. When jobInfo is nil (e.g. ingestion failure, malformed
-// job), only the DB status transition is performed.
+// handleFailed finalizes a failed job by transitioning it to failed status.
 //
 // Records E2E latency as failed when jobInfo is available (nil-safe).
-// Uses a detached context so that a concurrent SIGTERM cannot abort the upload or DB write.
+// Uses a detached context so that a concurrent SIGTERM cannot abort the DB write.
 // If the caller already has a tighter deadline (e.g. panic recovery), that deadline is respected.
 func (p *Processor) handleFailed(
 	ctx context.Context,
@@ -485,12 +442,7 @@ func (p *Processor) handleFailed(
 
 	logger := logr.FromContextOrDiscard(ctx)
 
-	var outputFileID, errorFileID string
-	if jobInfo != nil {
-		outputFileID, errorFileID = p.uploadPartialResults(ioCtx, jobInfo, jobItem)
-	}
-
-	if err := updater.UpdateFailedStatus(ioCtx, jobItem, requestCounts, outputFileID, errorFileID); err != nil {
+	if err := updater.UpdateFailedStatus(ioCtx, jobItem, requestCounts, "", ""); err != nil {
 		logger.Error(err, "Failed to update status to failed")
 		return err
 	}
@@ -501,7 +453,7 @@ func (p *Processor) handleFailed(
 
 	recordE2ELatency(jobInfo, metrics.E2EStatusFailed)
 	metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-	logger.V(logging.INFO).Info("Job failed handled", "outputFileID", outputFileID, "errorFileID", errorFileID)
+	logger.V(logging.INFO).Info("Job failed handled")
 	return nil
 }
 

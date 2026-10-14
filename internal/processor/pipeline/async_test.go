@@ -106,10 +106,9 @@ func TestAsyncEndToEnd(t *testing.T) {
 	}
 
 	pending := NewPendingRequests(0)
-	outputFile := tempFile(t)
-	errorFile := tempFile(t)
+	sink := &fakeSink{}
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", 0, logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
+	checkpointer := NewResultCheckpointer(sink, pending, tracker, logr.Discard())
 
 	dispatcher := NewAsyncDispatcher(resolver,
 		broadcasters,
@@ -118,7 +117,7 @@ func TestAsyncEndToEnd(t *testing.T) {
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
 		Dispatcher: dispatcher,
-		Collector:  collector,
+		Collector:  checkpointer,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
 	})
@@ -163,7 +162,7 @@ func TestAsyncEndToEnd(t *testing.T) {
 		t.Errorf("submitted requests = %d, want %d before results", submitted, len(items))
 	}
 
-	outputData := readFile(t, outputFile)
+	outputData := sinkOutputBytes(t, sink)
 	lines := countLines(outputData)
 	if lines != 3 {
 		t.Errorf("output lines = %d, want 3", lines)
@@ -408,10 +407,9 @@ func TestAsyncDispatcher_ParseError(t *testing.T) {
 	}
 
 	pending := NewPendingRequests(0)
-	outputFile := tempFile(t)
-	errorFile := tempFile(t)
+	sink := &fakeSink{}
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", 0, logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
+	checkpointer := NewResultCheckpointer(sink, pending, tracker, logr.Discard())
 
 	dispatcher := NewPreDispatcher(NewAsyncDispatcher(resolver,
 		broadcasters,
@@ -420,7 +418,7 @@ func TestAsyncDispatcher_ParseError(t *testing.T) {
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
 		Dispatcher: dispatcher,
-		Collector:  collector,
+		Collector:  checkpointer,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
 	})
@@ -443,13 +441,13 @@ func TestAsyncDispatcher_ParseError(t *testing.T) {
 		t.Errorf("Failed = %d, want 1", counts.Failed)
 	}
 
-	outputData := readFile(t, outputFile)
+	outputData := sinkOutputBytes(t, sink)
 	outputLines := countLines(outputData)
 	if outputLines != 2 {
 		t.Fatalf("output lines = %d, want 2", outputLines)
 	}
 
-	errorData := readFile(t, errorFile)
+	errorData := sinkErrorBytes(t, sink)
 	errorLines := splitLines(errorData)
 	if len(errorLines) != 1 {
 		t.Fatalf("error lines = %d, want 1 (parse error)", len(errorLines))
@@ -482,10 +480,9 @@ func TestAsyncDispatcher_ModelNotFound(t *testing.T) {
 	}
 
 	pending := NewPendingRequests(0)
-	outputFile := tempFile(t)
-	errorFile := tempFile(t)
+	sink := &fakeSink{}
 	tracker := NewProgressTracker(int64(len(items)), nil, "test-job", 0, logr.Discard())
-	collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
+	checkpointer := NewResultCheckpointer(sink, pending, tracker, logr.Discard())
 
 	dispatcher := NewAsyncDispatcher(resolver,
 		broadcasters,
@@ -494,7 +491,7 @@ func TestAsyncDispatcher_ModelNotFound(t *testing.T) {
 	executor := NewJobExecutor(JobExecutorConfig{
 		Source:     &sliceSource{items: items},
 		Dispatcher: dispatcher,
-		Collector:  collector,
+		Collector:  checkpointer,
 		Tracker:    tracker,
 		Logger:     logr.Discard(),
 	})
@@ -516,7 +513,7 @@ func TestAsyncDispatcher_ModelNotFound(t *testing.T) {
 		t.Errorf("Failed = %d, want 1", counts.Failed)
 	}
 
-	errorData := readFile(t, errorFile)
+	errorData := sinkErrorBytes(t, sink)
 	errorLines := splitLines(errorData)
 	if len(errorLines) != 1 {
 		t.Fatalf("error lines = %d, want 1", len(errorLines))
@@ -614,10 +611,9 @@ func TestAsyncCancellation(t *testing.T) {
 
 			items := makeItems(10, "m1")
 			pending := NewPendingRequests(0)
-			outputFile := tempFile(t)
-			errorFile := tempFile(t)
+			sink := &fakeSink{}
 			tracker := NewProgressTracker(int64(len(items)), nil, "test-job", 0, logr.Discard())
-			collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
+			checkpointer := NewResultCheckpointer(sink, pending, tracker, logr.Discard())
 			dispatcher := NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard())
 			deliveryDone := make(chan struct{})
 			executor := NewJobExecutor(JobExecutorConfig{
@@ -642,7 +638,7 @@ func TestAsyncCancellation(t *testing.T) {
 					return nil
 				}),
 				Dispatcher: dispatcher,
-				Collector:  collector,
+				Collector:  checkpointer,
 				Tracker:    tracker,
 				Logger:     logr.Discard(),
 			})
@@ -703,10 +699,10 @@ func TestAsyncCancellation(t *testing.T) {
 				t.Errorf("counts = %+v, want 3 completed and %d failed", counts, len(items)-3)
 			}
 
-			if got := countLines(readFile(t, outputFile)); got != 3 {
+			if got := countLines(sinkOutputBytes(t, sink)); got != 3 {
 				t.Errorf("output lines = %d, want 3", got)
 			}
-			errorLines := splitLines(readFile(t, errorFile))
+			errorLines := splitLines(sinkErrorBytes(t, sink))
 			if len(errorLines) != len(items)-3 {
 				t.Fatalf("error lines = %d, want %d", len(errorLines), len(items)-3)
 			}
@@ -778,10 +774,9 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 		client, resolver, broadcasters := newEnv(t)
 
 		pending := NewPendingRequests(0)
-		outputFile := tempFile(t)
-		errorFile := tempFile(t)
+		sink := &fakeSink{}
 		tracker := NewProgressTracker(3, nil, "test-job", 0, logr.Discard())
-		collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
+		checkpointer := NewResultCheckpointer(sink, pending, tracker, logr.Discard())
 
 		dispatcher := NewPreDispatcher(NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard())).
 			WithBeforeSubmit(func(msg *RequestItem) (bool, error) {
@@ -794,7 +789,7 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 		executor := NewJobExecutor(JobExecutorConfig{
 			Source:     &sliceSource{items: items()},
 			Dispatcher: dispatcher,
-			Collector:  collector,
+			Collector:  checkpointer,
 			Tracker:    tracker,
 			Logger:     logr.Discard(),
 		})
@@ -824,7 +819,7 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 		if counts.Completed != 1 || counts.Failed != 0 {
 			t.Errorf("counts = completed %d / failed %d, want 1 / 0", counts.Completed, counts.Failed)
 		}
-		if lines := countLines(readFile(t, outputFile)); lines != 1 {
+		if lines := countLines(sinkOutputBytes(t, sink)); lines != 1 {
 			t.Errorf("output lines = %d, want 1", lines)
 		}
 	})
@@ -833,10 +828,9 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 		client, resolver, broadcasters := newEnv(t)
 
 		pending := NewPendingRequests(0)
-		outputFile := tempFile(t)
-		errorFile := tempFile(t)
+		sink := &fakeSink{}
 		tracker := NewProgressTracker(3, nil, "test-job", 0, logr.Discard())
-		collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
+		checkpointer := NewResultCheckpointer(sink, pending, tracker, logr.Discard())
 
 		dispatcher := NewPreDispatcher(NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard())).
 			WithBeforeSubmit(func(msg *RequestItem) (bool, error) {
@@ -849,7 +843,7 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 		executor := NewJobExecutor(JobExecutorConfig{
 			Source:     &sliceSource{items: items()},
 			Dispatcher: dispatcher,
-			Collector:  collector,
+			Collector:  checkpointer,
 			Tracker:    tracker,
 			Logger:     logr.Discard(),
 		})
@@ -877,7 +871,7 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 			t.Errorf("counts = completed %d / failed %d, want 2 / 1", counts.Completed, counts.Failed)
 		}
 
-		errorLines := splitLines(readFile(t, errorFile))
+		errorLines := splitLines(sinkErrorBytes(t, sink))
 		if len(errorLines) != 1 {
 			t.Fatalf("error lines = %d, want 1", len(errorLines))
 		}
@@ -894,10 +888,9 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 		client, resolver, broadcasters := newEnv(t)
 
 		pending := NewPendingRequests(0)
-		outputFile := tempFile(t)
-		errorFile := tempFile(t)
+		sink := &fakeSink{}
 		tracker := NewProgressTracker(3, nil, "test-job", 0, logr.Discard())
-		collector := NewResultCollector(outputFile, errorFile, pending, tracker, logr.Discard())
+		checkpointer := NewResultCheckpointer(sink, pending, tracker, logr.Discard())
 
 		dispatcher := NewPreDispatcher(NewAsyncDispatcher(resolver, broadcasters, pending, logr.Discard())).
 			WithBeforeSubmit(func(msg *RequestItem) (bool, error) {
@@ -908,7 +901,7 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 		executor := NewJobExecutor(JobExecutorConfig{
 			Source:     &sliceSource{items: items()},
 			Dispatcher: dispatcher,
-			Collector:  collector,
+			Collector:  checkpointer,
 			Tracker:    tracker,
 			Logger:     logr.Discard(),
 		})

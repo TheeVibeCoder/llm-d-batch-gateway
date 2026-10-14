@@ -53,13 +53,11 @@ var errResumableRecoveryUnavailable = errors.New("resumable recovery is not enab
 // recoveryResult carries the outcome of a recover* function back to recoverJob
 // so that cleanup, metrics, and fallback logic are handled in a single place.
 type recoveryResult struct {
-	action       string // recoveryAction* constant for RecordStartupRecovery
-	e2eStatus    string // metrics.E2EStatus* constant for recordE2ELatency
-	statusLabel  string // DB status label for RecordStartupRecovery (e.g. "finalizing")
-	counts       *openai.BatchRequestCounts
-	outputFileID string
-	errorFileID  string
-	cancelPhase  string // non-empty → RecordCancellation is called
+	action      string // recoveryAction* constant for RecordStartupRecovery
+	e2eStatus   string // metrics.E2EStatus* constant for recordE2ELatency
+	statusLabel string // DB status label for RecordStartupRecovery (e.g. "finalizing")
+	counts      *openai.BatchRequestCounts
+	cancelPhase string // non-empty → RecordCancellation is called
 }
 
 // recoverOwnedJobs claims every non-terminal job owned by this processor
@@ -192,17 +190,16 @@ func (p *Processor) recoverJobOnce(ctx context.Context, jobID string) error {
 
 	var result *recoveryResult
 	switch status {
-	case openai.BatchStatusFinalizing:
-		result, err = p.recoverFinalizing(ctx, dbItem, jobInfo)
-
-	case openai.BatchStatusCancelling:
-		result, err = p.recoverCancelling(ctx, dbItem, jobInfo)
-
-	case openai.BatchStatusInProgress:
-		result, err = p.recoverInProgress(ctx, dbItem, jobInfo)
-
 	case openai.BatchStatusValidating:
 		result, err = p.recoverReEnqueue(ctx, dbItem, jobInfo, false)
+
+	case openai.BatchStatusInProgress, openai.BatchStatusFinalizing, openai.BatchStatusCancelling:
+		// A non-resumable row in an execution status predates the unified
+		// pipeline (which activates every batch before execution); its
+		// progress is not recoverable, so fail it closed.
+		logger.Info("Startup recovery: legacy non-resumable row in an execution status, failing closed",
+			"status", string(status))
+		return p.recoverWithFailed(ctx, dbItem, fmt.Errorf("non-resumable %s row is not recoverable", status), nil, jobInfo)
 
 	default:
 		if status.IsTerminal() {
@@ -241,90 +238,6 @@ func (p *Processor) recoverJobOnce(ctx context.Context, jobID string) error {
 // the terminal failed status) or nil when no partial state was created
 // (e.g. SLO extraction or re-enqueue failed before any uploads).
 // ---------------------------------------------------------------------------
-
-// recoverFinalizing completes a job that crashed during the upload phase.
-// Output files should be complete on disk since execution finished before finalizing.
-func (p *Processor) recoverFinalizing(ctx context.Context, dbItem *db.BatchItem, jobInfo *batch_types.JobInfo) (*recoveryResult, error) {
-	counts := p.extractRequestCounts(dbItem)
-	outputFileID, errorFileID := p.uploadPartialResults(ctx, jobInfo, dbItem)
-
-	result := &recoveryResult{
-		action:       recoveryActionFinalized,
-		e2eStatus:    metrics.E2EStatusCompleted,
-		statusLabel:  string(openai.BatchStatusFinalizing),
-		counts:       counts,
-		outputFileID: outputFileID,
-		errorFileID:  errorFileID,
-	}
-
-	if err := p.updater.UpdateCompletedStatus(ctx, dbItem, counts, outputFileID, errorFileID); err != nil {
-		return result, err
-	}
-	return result, nil
-}
-
-// recoverCancelling completes a cancellation that was interrupted by crash.
-func (p *Processor) recoverCancelling(ctx context.Context, dbItem *db.BatchItem, jobInfo *batch_types.JobInfo) (*recoveryResult, error) {
-	counts := p.extractRequestCounts(dbItem)
-	outputFileID, errorFileID := p.uploadPartialResults(ctx, jobInfo, dbItem)
-
-	cancelPhase := metrics.CancelPhaseQueued
-	if counts != nil {
-		cancelPhase = metrics.CancelPhaseInProgress
-	}
-
-	result := &recoveryResult{
-		action:       recoveryActionCancelled,
-		e2eStatus:    metrics.E2EStatusCancelled,
-		statusLabel:  string(openai.BatchStatusCancelling),
-		counts:       counts,
-		outputFileID: outputFileID,
-		errorFileID:  errorFileID,
-		cancelPhase:  cancelPhase,
-	}
-
-	if err := p.updater.UpdateCancelledStatus(ctx, dbItem, counts, outputFileID, errorFileID); err != nil {
-		return result, err
-	}
-	return result, nil
-}
-
-// recoverInProgress handles a job that crashed during inference execution.
-// If the output file exists and has non-zero size, inference made meaningful progress
-// — upload partial results and mark as failed.
-// If output is empty or absent, inference barely started — re-enqueue for retry.
-func (p *Processor) recoverInProgress(ctx context.Context, dbItem *db.BatchItem, jobInfo *batch_types.JobInfo) (*recoveryResult, error) {
-	logger := logr.FromContextOrDiscard(ctx)
-
-	hasOutput, err := p.outputFileHasContent(dbItem.ID, dbItem.TenantID)
-	if err != nil {
-		logger.Error(err, "Startup recovery: failed to check output file, treating as empty")
-	}
-
-	if hasOutput {
-		return p.recoverInProgressWithPartial(ctx, dbItem, jobInfo)
-	}
-	return p.recoverReEnqueue(ctx, dbItem, jobInfo, true)
-}
-
-func (p *Processor) recoverInProgressWithPartial(ctx context.Context, dbItem *db.BatchItem, jobInfo *batch_types.JobInfo) (*recoveryResult, error) {
-	counts := p.extractRequestCounts(dbItem)
-	outputFileID, errorFileID := p.uploadPartialResults(ctx, jobInfo, dbItem)
-
-	result := &recoveryResult{
-		action:       recoveryActionFailed,
-		e2eStatus:    metrics.E2EStatusFailed,
-		statusLabel:  string(openai.BatchStatusInProgress),
-		counts:       counts,
-		outputFileID: outputFileID,
-		errorFileID:  errorFileID,
-	}
-
-	if err := p.updater.UpdateFailedStatus(ctx, dbItem, counts, outputFileID, errorFileID); err != nil {
-		return result, err
-	}
-	return result, nil
-}
 
 // recoverReEnqueue re-enqueues a job for retry. Used for both in_progress (no
 // partial output) and validating statuses. When resetToValidating is true
@@ -365,26 +278,22 @@ func (p *Processor) recoverReEnqueue(ctx context.Context, dbItem *db.BatchItem, 
 	}, nil
 }
 
-// recoverExpired uploads any surviving partial files and transitions a job to expired status.
+// recoverExpired transitions a job to expired status (a re-enqueue whose SLO
+// deadline already passed).
 func (p *Processor) recoverExpired(ctx context.Context, dbItem *db.BatchItem, jobInfo *batch_types.JobInfo, statusLabel string) (*recoveryResult, error) {
 	counts := p.extractRequestCounts(dbItem)
-	outputFileID, errorFileID := p.uploadPartialResults(ctx, jobInfo, dbItem)
 
-	if err := p.updater.UpdateExpiredStatus(ctx, dbItem, counts, outputFileID, errorFileID); err != nil {
+	if err := p.updater.UpdateExpiredStatus(ctx, dbItem, counts, "", ""); err != nil {
 		return &recoveryResult{
-			counts:       counts,
-			outputFileID: outputFileID,
-			errorFileID:  errorFileID,
+			counts: counts,
 		}, fmt.Errorf("failed to update expired status: %w", err)
 	}
 
 	return &recoveryResult{
-		action:       recoveryActionExpired,
-		e2eStatus:    metrics.E2EStatusExpired,
-		statusLabel:  statusLabel,
-		counts:       counts,
-		outputFileID: outputFileID,
-		errorFileID:  errorFileID,
+		action:      recoveryActionExpired,
+		e2eStatus:   metrics.E2EStatusExpired,
+		statusLabel: statusLabel,
+		counts:      counts,
 	}, nil
 }
 
@@ -399,14 +308,11 @@ func (p *Processor) recoverWithFailed(ctx context.Context, dbItem *db.BatchItem,
 	logger := logr.FromContextOrDiscard(ctx)
 
 	var counts *openai.BatchRequestCounts
-	var outputFileID, errorFileID string
 	if result != nil {
 		counts = result.counts
-		outputFileID = result.outputFileID
-		errorFileID = result.errorFileID
 	}
 
-	if err := p.updater.UpdateFailedStatus(ctx, dbItem, counts, outputFileID, errorFileID); err != nil {
+	if err := p.updater.UpdateFailedStatus(ctx, dbItem, counts, "", ""); err != nil {
 		logger.Error(err, "Startup recovery: failed to mark job as failed (job will remain stuck)")
 		return err
 	}
@@ -421,22 +327,6 @@ func (p *Processor) recoverWithFailed(ctx context.Context, dbItem *db.BatchItem,
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-// outputFileHasContent checks whether the output.jsonl file exists and has content.
-func (p *Processor) outputFileHasContent(jobID, tenantID string) (bool, error) {
-	outputPath, err := p.jobOutputFilePath(jobID, tenantID)
-	if err != nil {
-		return false, err
-	}
-	stat, err := os.Stat(outputPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	return stat.Size() > 0, nil
-}
 
 // extractRequestCounts parses RequestCounts from the DB status JSON.
 func (p *Processor) extractRequestCounts(dbItem *db.BatchItem) *openai.BatchRequestCounts {

@@ -1650,25 +1650,27 @@ func TestPreProcess_UnregisteredModel_RejectedToErrorFile(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
+	manifest, err := p.preProcessJob(ctx, jobInfo)
+	if err != nil {
 		t.Fatalf("preProcessJob: %v", err)
 	}
 
-	// Error file should contain exactly 1 line for model-b
-	errorPath, _ := p.jobErrorFilePath(jobID, tenantID)
-	errorBytes, err := os.ReadFile(errorPath)
-	if err != nil {
-		t.Fatalf("read error file: %v", err)
+	// The rejected line carries its error-object line, which activation
+	// stores as the entry's result object.
+	var rejected []byte
+	for _, e := range manifest.Entries {
+		if e.Rejected {
+			rejected = e.ErrLine
+		}
 	}
-	errorLines := bytes.Split(bytes.TrimSpace(errorBytes), []byte{'\n'})
-	if len(errorLines) != 1 {
-		t.Fatalf("error file lines = %d, want 1", len(errorLines))
+	if rejected == nil {
+		t.Fatal("no rejected entry in the manifest")
 	}
-	if !bytes.Contains(errorLines[0], []byte(`"model_not_found"`)) {
-		t.Fatalf("error line missing model_not_found code: %s", errorLines[0])
+	if !bytes.Contains(rejected, []byte(`"model_not_found"`)) {
+		t.Fatalf("error line missing model_not_found code: %s", rejected)
 	}
-	if !bytes.Contains(errorLines[0], []byte(`"req-2"`)) {
-		t.Fatalf("error line missing custom_id req-2: %s", errorLines[0])
+	if !bytes.Contains(rejected, []byte(`"req-2"`)) {
+		t.Fatalf("error line missing custom_id req-2: %s", rejected)
 	}
 
 	// model_map.json should record 1 rejected request
@@ -1880,16 +1882,6 @@ func TestPreProcess_AllRequestsUnregistered_ExecuteJobCounts(t *testing.T) {
 		t.Fatalf("preProcessJob: %v", err)
 	}
 
-	errorPath, _ := p.jobErrorFilePath(jobID, tenantID)
-	errorBytes, err := os.ReadFile(errorPath)
-	if err != nil {
-		t.Fatalf("read error file: %v", err)
-	}
-	errorLines := bytes.Split(bytes.TrimSpace(errorBytes), []byte{'\n'})
-	if len(errorLines) != 3 {
-		t.Fatalf("error file lines = %d, want 3", len(errorLines))
-	}
-
 	jobRootDir, _ := p.jobRootDir(jobID, tenantID)
 	mm, err := readModelMap(jobRootDir)
 	if err != nil {
@@ -1931,100 +1923,6 @@ func TestPreProcess_AllRequestsUnregistered_ExecuteJobCounts(t *testing.T) {
 	}
 	if counts.Total != 3 || counts.Failed != 3 || counts.Completed != 0 {
 		t.Fatalf("counts = %+v, want Total=3 Failed=3 Completed=0", counts)
-	}
-}
-
-// TestPreProcess_ReEnqueue_TruncatesStaleErrorFile verifies that when a job is
-// re-enqueued (e.g. after pod shutdown), the next ingestion run truncates any
-// stale error.jsonl left by the previous attempt. Without truncation, execution's
-// O_APPEND would mix stale entries with fresh ones.
-func TestPreProcess_ReEnqueue_TruncatesStaleErrorFile(t *testing.T) {
-	ctx := testLoggerCtx(t)
-
-	workDir := t.TempDir()
-	cfg := config.NewConfig()
-	cfg.WorkDir = workDir
-
-	dbClient := newMockBatchDBClient()
-	fileDBClient := newMockFileDBClient()
-	filesClient := mockfiles.NewMockBatchFilesClient(t.TempDir())
-
-	tenantID := "tenant__tenantA"
-	folder, _ := ucom.GetFolderNameByTenantID(tenantID)
-	filename := "input.jsonl"
-
-	// All models are registered — no rejections expected.
-	lines := [][]byte{
-		[]byte(`{"custom_id":"req-1","method":"POST","url":"/v1/chat/completions","body":{"model":"model-a","messages":[{"role":"user","content":"hi"}]}}` + "\n"),
-	}
-	var remoteBuf bytes.Buffer
-	for _, ln := range lines {
-		remoteBuf.Write(ln)
-	}
-
-	inputFileID := "file-reenqueue"
-	if _, err := filesClient.Store(ctx, ucom.FileStorageName(inputFileID, filename), folder, 0, 0, bytes.NewReader(remoteBuf.Bytes())); err != nil {
-		t.Fatalf("files.Store: %v", err)
-	}
-	fileSpec := &openai.FileObject{Filename: filename}
-	fileItem := &db.FileItem{
-		BaseIndexes:  db.BaseIndexes{ID: inputFileID, TenantID: tenantID},
-		BaseContents: db.BaseContents{Spec: mustJSON(t, fileSpec)},
-	}
-	if err := fileDBClient.DBStore(ctx, fileItem); err != nil {
-		t.Fatalf("DBStore file item: %v", err)
-	}
-
-	resolver, err := inference.NewPerModelResolver(
-		map[string]inference.GatewayClientConfig{
-			"model-a": {URL: "http://fake:8000"},
-		},
-		testLogger(t),
-	)
-	if err != nil {
-		t.Fatalf("NewPerModelResolver: %v", err)
-	}
-
-	clients := &clientset.Clientset{
-		BatchDB:   dbClient,
-		FileDB:    fileDBClient,
-		File:      filesClient,
-		Inference: resolver,
-	}
-	p := mustNewProcessor(t, cfg, clients)
-
-	jobID := "job-reenqueue"
-	jobInfo := &batch_types.JobInfo{
-		JobID: jobID,
-		BatchJob: &openai.Batch{
-			ID:              jobID,
-			BatchSpec:       openai.BatchSpec{InputFileID: inputFileID, Endpoint: openai.EndpointChatCompletions},
-			BatchStatusInfo: openai.BatchStatusInfo{Status: openai.BatchStatusInProgress},
-		},
-		TenantID: tenantID,
-	}
-
-	// Simulate a stale error.jsonl from a previous attempt.
-	errorPath, _ := p.jobErrorFilePath(jobID, tenantID)
-	jobRootDir, _ := p.jobRootDir(jobID, tenantID)
-	if err := os.MkdirAll(jobRootDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	if err := os.WriteFile(errorPath, []byte(`{"id":"stale","custom_id":"old","error":{"code":"stale_error","message":"from previous attempt"}}`+"\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile stale error: %v", err)
-	}
-
-	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
-		t.Fatalf("preProcessJob: %v", err)
-	}
-
-	// error.jsonl should be empty (truncated by ingestion, no rejections this time).
-	errorBytes, err := os.ReadFile(errorPath)
-	if err != nil {
-		t.Fatalf("read error file: %v", err)
-	}
-	if len(bytes.TrimSpace(errorBytes)) != 0 {
-		t.Fatalf("expected empty error.jsonl after re-enqueue with no rejections, got:\n%s", errorBytes)
 	}
 }
 

@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,13 +18,11 @@ import (
 	"github.com/go-logr/logr/testr"
 	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
 	mockdb "github.com/llm-d/llm-d-batch-gateway/internal/database/mock"
-	filesapi "github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 	mockfiles "github.com/llm-d/llm-d-batch-gateway/internal/files_store/mock"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/config"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/clientset"
-	ucom "github.com/llm-d/llm-d-batch-gateway/internal/util/com"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/semaphore"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
@@ -153,72 +150,6 @@ func (c *fakeAsyncInferenceClient) deliverStatus(requestID string, statusCode in
 		StatusCode: statusCode,
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Mock files client (upload retry testing)
-// ---------------------------------------------------------------------------
-
-type failNTimesFilesClient struct {
-	failCount    int
-	calls        int
-	lastMeta     *filesapi.BatchFileMetadata
-	lastFileName string // records the fileName passed to the most recent successful Store call
-}
-
-func (f *failNTimesFilesClient) Store(_ context.Context, fileName, _ string, _, _ int64, _ io.Reader) (*filesapi.BatchFileMetadata, error) {
-	f.calls++
-	if f.calls <= f.failCount {
-		return nil, errors.New("transient upload error")
-	}
-	f.lastFileName = fileName
-	f.lastMeta = &filesapi.BatchFileMetadata{Size: 42}
-	return f.lastMeta, nil
-}
-
-func (f *failNTimesFilesClient) Retrieve(_ context.Context, _, _ string) (io.ReadCloser, *filesapi.BatchFileMetadata, error) {
-	return nil, nil, nil
-}
-func (f *failNTimesFilesClient) List(_ context.Context, _ string) ([]filesapi.BatchFileMetadata, error) {
-	return nil, nil
-}
-func (f *failNTimesFilesClient) Delete(_ context.Context, _, _ string) error { return nil }
-func (f *failNTimesFilesClient) OpenStream(_ context.Context, _, _ string) (filesapi.StreamWriter, error) {
-	return nil, errors.New("not implemented")
-}
-func (f *failNTimesFilesClient) GetContext(p context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithCancel(p)
-}
-func (f *failNTimesFilesClient) Close() error { return nil }
-
-// failOnNthCallClient fails the Nth Store call (1-based). All other calls succeed.
-// Thread-safe for concurrent callers.
-type failOnNthCallClient struct {
-	failN   int32
-	calls   atomic.Int32
-	failErr error
-}
-
-func (f *failOnNthCallClient) Store(_ context.Context, _ string, _ string, _, _ int64, _ io.Reader) (*filesapi.BatchFileMetadata, error) {
-	n := f.calls.Add(1)
-	if n == f.failN {
-		return nil, f.failErr
-	}
-	return &filesapi.BatchFileMetadata{Size: 42}, nil
-}
-func (f *failOnNthCallClient) Retrieve(_ context.Context, _, _ string) (io.ReadCloser, *filesapi.BatchFileMetadata, error) {
-	return nil, nil, nil
-}
-func (f *failOnNthCallClient) List(_ context.Context, _ string) ([]filesapi.BatchFileMetadata, error) {
-	return nil, nil
-}
-func (f *failOnNthCallClient) Delete(_ context.Context, _, _ string) error { return nil }
-func (f *failOnNthCallClient) OpenStream(_ context.Context, _, _ string) (filesapi.StreamWriter, error) {
-	return nil, errors.New("not implemented")
-}
-func (f *failOnNthCallClient) GetContext(p context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithCancel(p)
-}
-func (f *failOnNthCallClient) Close() error { return nil }
 
 // ---------------------------------------------------------------------------
 // Mock DB error wrappers
@@ -538,25 +469,6 @@ func seedDBJob(t *testing.T, dbClient db.BatchProgressDBClient, jobID string) *d
 // Job setup helpers
 // ---------------------------------------------------------------------------
 
-// setupJobWithOutputFile creates a job directory with a non-empty output.jsonl
-// so that uploadFileAndStoreFileRecord can find and upload it.
-func setupJobWithOutputFile(t *testing.T, cfg *config.ProcessorConfig, jobID, tenantID string) *batch_types.JobInfo {
-	t.Helper()
-	folderName, err := ucom.GetFolderNameByTenantID(tenantID)
-	if err != nil {
-		t.Fatalf("GetFolderNameByTenantID: %v", err)
-	}
-	jobDir := filepath.Join(cfg.WorkDir, folderName, jobsDirName, jobID)
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	outputPath := filepath.Join(jobDir, outputFileName)
-	if err := os.WriteFile(outputPath, []byte(`{"id":"batch_req_1","custom_id":"req-1","response":{"status_code":200}}`+"\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	return &batch_types.JobInfo{JobID: jobID, TenantID: tenantID}
-}
-
 // activateJobEntries seeds the processor's claim on the batch and activates
 // one pending entry per custom ID, returning the result sink and DB item.
 // It mirrors runJob's activation for tests that drive executeJob directly.
@@ -676,27 +588,6 @@ func setupExecutionJob(
 	env.sink, env.jobItem = activateJobEntries(t, env.p, jobID, tenantID, customIDs)
 
 	return env, jobInfo
-}
-
-// createPartialOutputFiles creates dummy output.jsonl and error.jsonl under the job dir
-// so uploadPartialResults can find and upload them.
-func createPartialOutputFiles(t *testing.T, p *Processor, jobID, tenantID string) {
-	t.Helper()
-	jobDir, err := p.jobRootDir(jobID, tenantID)
-	if err != nil {
-		t.Fatalf("jobRootDir: %v", err)
-	}
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	outputPath := filepath.Join(jobDir, "output.jsonl")
-	errorPath := filepath.Join(jobDir, "error.jsonl")
-	if err := os.WriteFile(outputPath, []byte(`{"id":"batch_req_1","custom_id":"req-1","response":{"status_code":200}}`+"\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile output: %v", err)
-	}
-	if err := os.WriteFile(errorPath, []byte(`{"id":"batch_req_2","custom_id":"req-2","error":{"code":"batch_cancelled","message":"cancelled"}}`+"\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile error: %v", err)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -848,22 +739,6 @@ func readAtExact(t *testing.T, f *os.File, off int64, n uint32) []byte {
 		t.Fatalf("ReadAt short: got=%d want=%d", readN, n)
 	}
 	return buf
-}
-
-// readNonEmptyJSONLLines reads a JSONL file and returns non-empty lines as byte slices.
-func readNonEmptyJSONLLines(t *testing.T, path string) [][]byte {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile(%s): %v", path, err)
-	}
-	var lines [][]byte
-	for _, line := range bytes.Split(data, []byte{'\n'}) {
-		if len(bytes.TrimSpace(line)) > 0 {
-			lines = append(lines, line)
-		}
-	}
-	return lines
 }
 
 // initTestEndpointLimits creates per-endpoint AIMD+AdaptiveSemaphore pairs for

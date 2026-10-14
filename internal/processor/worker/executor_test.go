@@ -1,6 +1,8 @@
 package worker
 
 import (
+	dto "github.com/prometheus/client_model/go"
+
 	"bytes"
 	"context"
 	"encoding/json"
@@ -12,19 +14,18 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 
-	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
-	mockdb "github.com/llm-d/llm-d-batch-gateway/internal/database/mock"
-	mockfiles "github.com/llm-d/llm-d-batch-gateway/internal/files_store/mock"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/config"
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/metrics"
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
-	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/clientset"
-	ucom "github.com/llm-d/llm-d-batch-gateway/internal/util/com"
 
+	db "github.com/llm-d/llm-d-batch-gateway/internal/database/api"
+	mockdb "github.com/llm-d/llm-d-batch-gateway/internal/database/mock"
+	mockfiles "github.com/llm-d/llm-d-batch-gateway/internal/files_store/mock"
+	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
+	ucom "github.com/llm-d/llm-d-batch-gateway/internal/util/com"
 	httpclient "github.com/llm-d/llm-d-batch-gateway/pkg/clients/http"
 	"github.com/llm-d/llm-d-batch-gateway/pkg/clients/inference"
 )
@@ -268,8 +269,8 @@ func TestExecuteJob_ContextCancelled(t *testing.T) {
 	cancel(batchctx.ErrCancelled)
 
 	_, err := env.p.executeJob(ctx, &jobExecutionParams{
-		updater: env.updater,
-		jobInfo: jobInfo,
+		updater:    env.updater,
+		jobInfo:    jobInfo,
 		jobItem:    env.jobItem,
 		resultSink: env.sink,
 	})
@@ -304,8 +305,8 @@ func TestExecuteJob_UserCancelFlag(t *testing.T) {
 	env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{"m1": "m1"})
 
 	counts, err := env.p.executeJob(ctx, &jobExecutionParams{
-		updater: env.updater,
-		jobInfo: jobInfo,
+		updater:    env.updater,
+		jobInfo:    jobInfo,
 		jobItem:    env.jobItem,
 		resultSink: env.sink,
 	})
@@ -345,8 +346,8 @@ func TestExecuteJob_CancelAfterAllRequestsComplete(t *testing.T) {
 	env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{"m1": "m1"})
 
 	_, err := env.p.executeJob(ctx, &jobExecutionParams{
-		updater: env.updater,
-		jobInfo: jobInfo,
+		updater:    env.updater,
+		jobInfo:    jobInfo,
 		jobItem:    env.jobItem,
 		resultSink: env.sink,
 	})
@@ -379,8 +380,8 @@ func TestExecuteJob_SIGTERMAfterAllComplete(t *testing.T) {
 	env, jobInfo := setupExecutionJob(t, cfg, mock, requests, map[string]string{"m1": "m1"})
 
 	counts, err := env.p.executeJob(mainCtx, &jobExecutionParams{
-		updater: env.updater,
-		jobInfo: jobInfo,
+		updater:    env.updater,
+		jobInfo:    jobInfo,
 		jobItem:    env.jobItem,
 		resultSink: env.sink,
 	})
@@ -495,8 +496,8 @@ func TestExecuteJob_SLOExpiredBeforeDispatch(t *testing.T) {
 	defer cancel()
 
 	counts, err := env.p.executeJob(ctx, &jobExecutionParams{
-		updater: env.updater,
-		jobInfo: jobInfo,
+		updater:    env.updater,
+		jobInfo:    jobInfo,
 		jobItem:    env.jobItem,
 		resultSink: env.sink,
 	})
@@ -568,8 +569,8 @@ func TestExecuteJob_SLOExpiredDuringDispatch(t *testing.T) {
 	resCh := make(chan result, 1)
 	go func() {
 		counts, err := env.p.executeJob(ctx, &jobExecutionParams{
-			updater: env.updater,
-			jobInfo: jobInfo,
+			updater:    env.updater,
+			jobInfo:    jobInfo,
 			jobItem:    env.jobItem,
 			resultSink: env.sink,
 		})
@@ -618,96 +619,6 @@ func TestExecuteJob_SLOExpiredDuringDispatch(t *testing.T) {
 // Tests: finalizeJob
 // =====================================================================
 
-func TestFinalizeJob_Success(t *testing.T) {
-	cfg := config.NewConfig()
-	cfg.WorkDir = t.TempDir()
-	cfg.DefaultOutputExpirationSeconds = 86400
-
-	env := newTestProcessorEnv(t, cfg, &mockInferenceClient{})
-
-	jobID := "finalize-job"
-	tenantID := "tenant-1"
-	jobInfo := &batch_types.JobInfo{JobID: jobID, TenantID: tenantID}
-
-	jobDir, _ := env.p.jobRootDir(jobID, tenantID)
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	outputPath, _ := env.p.jobOutputFilePath(jobID, tenantID)
-	if err := os.WriteFile(outputPath, []byte(`{"id":"batch_req_1","custom_id":"r1","response":{"status_code":200}}`+"\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	dbJob := seedDBJob(t, env.dbClient, jobID)
-	counts := &openai.BatchRequestCounts{Total: 1, Completed: 1, Failed: 0}
-
-	ctx := testLoggerCtx(t)
-	err := env.p.finalizeJob(ctx, env.updater, dbJob, jobInfo, counts)
-	if err != nil {
-		t.Fatalf("finalizeJob error: %v", err)
-	}
-
-	items, _, _, err := env.dbClient.DBGet(ctx, &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
-	if err != nil || len(items) != 1 {
-		t.Fatalf("DBGet: err=%v len=%d", err, len(items))
-	}
-	var statusInfo openai.BatchStatusInfo
-	if err := json.Unmarshal(items[0].Status, &statusInfo); err != nil {
-		t.Fatalf("unmarshal status: %v", err)
-	}
-	if statusInfo.Status != openai.BatchStatusCompleted {
-		t.Fatalf("status = %s, want %s", statusInfo.Status, openai.BatchStatusCompleted)
-	}
-	if statusInfo.OutputFileID == nil {
-		t.Fatalf("expected OutputFileID to be set")
-	}
-}
-
-// TestFinalizeJob_UploadFailure verifies that when all uploads fail, finalizeJob marks the
-// job as failed (not completed) and returns errFinalizeFailedOver. The job must not be
-// marked completed with missing artifacts — that would violate the batch contract.
-func TestFinalizeJob_UploadFailure(t *testing.T) {
-	cfg := config.NewConfig()
-	cfg.WorkDir = t.TempDir()
-
-	env := newTestProcessorEnv(t, cfg, &mockInferenceClient{})
-	env.p.files.storage = &failNTimesFilesClient{failCount: 100}
-
-	jobID := "finalize-fail"
-	tenantID := "tenant-1"
-	jobInfo := &batch_types.JobInfo{JobID: jobID, TenantID: tenantID}
-
-	jobDir, _ := env.p.jobRootDir(jobID, tenantID)
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	outputPath, _ := env.p.jobOutputFilePath(jobID, tenantID)
-	if err := os.WriteFile(outputPath, []byte("output\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	dbJob := seedDBJob(t, env.dbClient, jobID)
-	counts := &openai.BatchRequestCounts{Total: 1, Completed: 1}
-
-	ctx := testLoggerCtx(t)
-	err := env.p.finalizeJob(ctx, env.updater, dbJob, jobInfo, counts)
-	if !errors.Is(err, errFinalizeFailedOver) {
-		t.Fatalf("expected errFinalizeFailedOver, got: %v", err)
-	}
-
-	items, _, _, getErr := env.dbClient.DBGet(ctx, &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
-	if getErr != nil || len(items) != 1 {
-		t.Fatalf("DBGet: err=%v len=%d", getErr, len(items))
-	}
-	var got openai.BatchStatusInfo
-	if err := json.Unmarshal(items[0].Status, &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if got.Status != openai.BatchStatusFailed {
-		t.Fatalf("status = %s, want failed (upload failure must not produce completed)", got.Status)
-	}
-}
-
 // =====================================================================
 // Tests: error file separation
 // =====================================================================
@@ -736,8 +647,8 @@ func TestExecuteJob_SeparatesSuccessAndErrors(t *testing.T) {
 
 	ctx := testLoggerCtx(t)
 	counts, err := env.p.executeJob(ctx, &jobExecutionParams{
-		updater: env.updater,
-		jobInfo: jobInfo,
+		updater:    env.updater,
+		jobInfo:    jobInfo,
 		jobItem:    env.jobItem,
 		resultSink: env.sink,
 	})
@@ -810,8 +721,8 @@ func TestExecuteJob_HTTPErrorGoesToOutputFile(t *testing.T) {
 
 	ctx := testLoggerCtx(t)
 	counts, err := env.p.executeJob(ctx, &jobExecutionParams{
-		updater: env.updater,
-		jobInfo: jobInfo,
+		updater:    env.updater,
+		jobInfo:    jobInfo,
 		jobItem:    env.jobItem,
 		resultSink: env.sink,
 	})
@@ -849,106 +760,6 @@ func TestExecuteJob_HTTPErrorGoesToOutputFile(t *testing.T) {
 	}
 	if httpLike != 2 || errored != 1 {
 		t.Fatalf("entries: http-like=%d errored=%d, want 2/1", httpLike, errored)
-	}
-}
-
-// TestFinalizeJob_EmptyOutputFile_OutputFileIDOmitted verifies that when the output
-// file is empty (all requests failed), output_file_id is omitted per the OpenAI spec.
-func TestFinalizeJob_EmptyOutputFile_OutputFileIDOmitted(t *testing.T) {
-	cfg := config.NewConfig()
-	cfg.WorkDir = t.TempDir()
-	cfg.DefaultOutputExpirationSeconds = 86400
-
-	env := newTestProcessorEnv(t, cfg, &mockInferenceClient{})
-
-	jobID := "finalize-empty-output"
-	tenantID := "tenant-1"
-	jobInfo := &batch_types.JobInfo{JobID: jobID, TenantID: tenantID}
-
-	jobDir, _ := env.p.jobRootDir(jobID, tenantID)
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	outputPath, _ := env.p.jobOutputFilePath(jobID, tenantID)
-	if err := os.WriteFile(outputPath, []byte{}, 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	errorPath, _ := env.p.jobErrorFilePath(jobID, tenantID)
-	if err := os.WriteFile(errorPath, []byte(`{"id":"batch_req_1","custom_id":"r1","error":{"code":"server_error","message":"fail"}}`+"\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	dbJob := seedDBJob(t, env.dbClient, jobID)
-	counts := &openai.BatchRequestCounts{Total: 1, Completed: 0, Failed: 1}
-
-	ctx := testLoggerCtx(t)
-	if err := env.p.finalizeJob(ctx, env.updater, dbJob, jobInfo, counts); err != nil {
-		t.Fatalf("finalizeJob error: %v", err)
-	}
-
-	items, _, _, err := env.dbClient.DBGet(ctx, &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
-	if err != nil || len(items) != 1 {
-		t.Fatalf("DBGet: err=%v len=%d", err, len(items))
-	}
-	var statusInfo openai.BatchStatusInfo
-	if err := json.Unmarshal(items[0].Status, &statusInfo); err != nil {
-		t.Fatalf("unmarshal status: %v", err)
-	}
-	if statusInfo.OutputFileID != nil {
-		t.Errorf("OutputFileID = %q, want nil (output file was empty)", *statusInfo.OutputFileID)
-	}
-	if statusInfo.ErrorFileID == nil {
-		t.Errorf("ErrorFileID should be set when error file has content")
-	}
-}
-
-// TestFinalizeJob_EmptyErrorFile_ErrorFileIDOmitted verifies that when the error
-// file is empty (no requests failed), error_file_id is omitted per the OpenAI spec.
-func TestFinalizeJob_EmptyErrorFile_ErrorFileIDOmitted(t *testing.T) {
-	cfg := config.NewConfig()
-	cfg.WorkDir = t.TempDir()
-	cfg.DefaultOutputExpirationSeconds = 86400
-
-	env := newTestProcessorEnv(t, cfg, &mockInferenceClient{})
-
-	jobID := "finalize-empty-error"
-	tenantID := "tenant-1"
-	jobInfo := &batch_types.JobInfo{JobID: jobID, TenantID: tenantID}
-
-	jobDir, _ := env.p.jobRootDir(jobID, tenantID)
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	outputPath, _ := env.p.jobOutputFilePath(jobID, tenantID)
-	if err := os.WriteFile(outputPath, []byte(`{"id":"batch_req_1","custom_id":"r1","response":{"status_code":200}}`+"\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	errorPath, _ := env.p.jobErrorFilePath(jobID, tenantID)
-	if err := os.WriteFile(errorPath, []byte{}, 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	dbJob := seedDBJob(t, env.dbClient, jobID)
-	counts := &openai.BatchRequestCounts{Total: 1, Completed: 1, Failed: 0}
-
-	ctx := testLoggerCtx(t)
-	if err := env.p.finalizeJob(ctx, env.updater, dbJob, jobInfo, counts); err != nil {
-		t.Fatalf("finalizeJob error: %v", err)
-	}
-
-	items, _, _, err := env.dbClient.DBGet(ctx, &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
-	if err != nil || len(items) != 1 {
-		t.Fatalf("DBGet: err=%v len=%d", err, len(items))
-	}
-	var statusInfo openai.BatchStatusInfo
-	if err := json.Unmarshal(items[0].Status, &statusInfo); err != nil {
-		t.Fatalf("unmarshal status: %v", err)
-	}
-	if statusInfo.OutputFileID == nil {
-		t.Errorf("OutputFileID should be set when output file has content")
-	}
-	if statusInfo.ErrorFileID != nil {
-		t.Errorf("ErrorFileID = %q, want nil (error file was empty)", *statusInfo.ErrorFileID)
 	}
 }
 
@@ -1195,70 +1006,6 @@ func TestHandleJobError_ExpiredDuringIngestion_NilCountsTransitionsExpired(t *te
 // with partial output
 // =====================================================================
 
-func TestHandleCancelled_Execution_UploadsPartialOutput(t *testing.T) {
-	cfg := config.NewConfig()
-	cfg.WorkDir = t.TempDir()
-
-	env := newTestProcessorEnv(t, cfg, &mockInferenceClient{})
-
-	jobID := "job-cancel-partial"
-	tenantID := "tenant__tenantA"
-	dbJob := &db.BatchItem{
-		BaseIndexes:  db.BaseIndexes{ID: jobID, TenantID: tenantID, Tags: db.Tags{}},
-		BaseContents: db.BaseContents{Status: mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusCancelling})},
-	}
-	if err := env.dbClient.DBStore(context.Background(), dbJob); err != nil {
-		t.Fatalf("DBStore: %v", err)
-	}
-
-	createPartialOutputFiles(t, env.p, jobID, tenantID)
-
-	jobInfo := &batch_types.JobInfo{
-		JobID:    jobID,
-		TenantID: tenantID,
-		BatchJob: &openai.Batch{BatchSpec: openai.BatchSpec{CreatedAt: time.Now().Add(-10 * time.Second).Unix()}},
-	}
-	counts := &openai.BatchRequestCounts{Total: 5, Completed: 3, Failed: 2}
-
-	before := gatherHistogramSampleCount(t, "batch_job_e2e_latency_seconds", map[string]string{"status": "cancelled"})
-
-	ctx := testLoggerCtx(t)
-	if err := env.p.handleCancelled(ctx, &jobExecutionParams{
-		updater:       env.updater,
-		jobItem:       dbJob,
-		jobInfo:       jobInfo,
-		requestCounts: counts,
-	}); err != nil {
-		t.Fatalf("handleCancelled: %v", err)
-	}
-
-	after := gatherHistogramSampleCount(t, "batch_job_e2e_latency_seconds", map[string]string{"status": "cancelled"})
-	if delta := after - before; delta != 1 {
-		t.Fatalf("E2E latency cancelled: delta=%d, want 1", delta)
-	}
-
-	items, _, _, err := env.dbClient.DBGet(ctx, &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
-	if err != nil || len(items) != 1 {
-		t.Fatalf("DBGet: err=%v len=%d", err, len(items))
-	}
-	var got openai.BatchStatusInfo
-	if err := json.Unmarshal(items[0].Status, &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if got.Status != openai.BatchStatusCancelled {
-		t.Fatalf("status = %s, want cancelled", got.Status)
-	}
-	if got.RequestCounts.Total != 5 || got.RequestCounts.Completed != 3 || got.RequestCounts.Failed != 2 {
-		t.Fatalf("request_counts = %+v, want {5,3,2}", got.RequestCounts)
-	}
-	if got.OutputFileID == nil {
-		t.Fatal("expected output_file_id to be set")
-	}
-	if got.ErrorFileID == nil {
-		t.Fatal("expected error_file_id to be set")
-	}
-}
-
 // TestHandleCancelled_CancelledWriteFails_FallsBackToFailed verifies that when
 // UpdateCancelledStatus fails inside handleCancelled, the fallback writes "failed"
 // status with file IDs preserved. This mirrors the failover pattern in finalizeJob.
@@ -1290,8 +1037,6 @@ func TestHandleCancelled_CancelledWriteFails_FallsBackToFailed(t *testing.T) {
 	p.poller = NewPoller(clients.Queue, failDB)
 	updater := NewStatusUpdater(failDB)
 
-	createPartialOutputFiles(t, p, jobID, tenantID)
-
 	jobInfo := &batch_types.JobInfo{
 		JobID:    jobID,
 		TenantID: tenantID,
@@ -1322,59 +1067,8 @@ func TestHandleCancelled_CancelledWriteFails_FallsBackToFailed(t *testing.T) {
 	if got.Status != openai.BatchStatusFailed {
 		t.Fatalf("status = %s, want failed", got.Status)
 	}
-	if got.OutputFileID == nil {
-		t.Fatal("output_file_id must be preserved in fallback, got nil")
-	}
 	if got.RequestCounts.Total != 5 || got.RequestCounts.Completed != 3 || got.RequestCounts.Failed != 2 {
 		t.Fatalf("request_counts = %+v, want {5,3,2}", got.RequestCounts)
-	}
-}
-
-func TestHandleFailed_Execution_UploadsPartialOutput(t *testing.T) {
-	cfg := config.NewConfig()
-	cfg.WorkDir = t.TempDir()
-
-	env := newTestProcessorEnv(t, cfg, &mockInferenceClient{})
-
-	jobID := "job-fail-partial"
-	tenantID := "tenant__tenantA"
-	dbJob := &db.BatchItem{
-		BaseIndexes:  db.BaseIndexes{ID: jobID, TenantID: tenantID, Tags: db.Tags{}},
-		BaseContents: db.BaseContents{Status: mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress})},
-	}
-	if err := env.dbClient.DBStore(context.Background(), dbJob); err != nil {
-		t.Fatalf("DBStore: %v", err)
-	}
-
-	createPartialOutputFiles(t, env.p, jobID, tenantID)
-
-	jobInfo := &batch_types.JobInfo{JobID: jobID, TenantID: tenantID}
-	counts := &openai.BatchRequestCounts{Total: 10, Completed: 7, Failed: 3}
-
-	ctx := testLoggerCtx(t)
-	if err := env.p.handleFailed(ctx, env.updater, dbJob, counts, jobInfo); err != nil {
-		t.Fatalf("handleFailed: %v", err)
-	}
-
-	items, _, _, err := env.dbClient.DBGet(ctx, &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
-	if err != nil || len(items) != 1 {
-		t.Fatalf("DBGet: err=%v len=%d", err, len(items))
-	}
-	var got openai.BatchStatusInfo
-	if err := json.Unmarshal(items[0].Status, &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if got.Status != openai.BatchStatusFailed {
-		t.Fatalf("status = %s, want failed", got.Status)
-	}
-	if got.RequestCounts.Total != 10 || got.RequestCounts.Completed != 7 || got.RequestCounts.Failed != 3 {
-		t.Fatalf("request_counts = %+v, want {10,7,3}", got.RequestCounts)
-	}
-	if got.OutputFileID == nil {
-		t.Fatal("expected output_file_id to be set")
-	}
-	if got.ErrorFileID == nil {
-		t.Fatal("expected error_file_id to be set")
 	}
 }
 
@@ -1462,148 +1156,6 @@ func TestHandleFailed_CancelledCtx_StillWritesDB(t *testing.T) {
 // =====================================================================
 // Tests: uploadPartialResults — empty / missing files
 // =====================================================================
-
-// TestUploadPartialResults_EmptyFiles verifies that when both output and error files
-// exist but are empty (0 bytes), uploadPartialResults returns empty file IDs and does
-// not create any file records in the database.
-func TestUploadPartialResults_EmptyFiles(t *testing.T) {
-	cfg := config.NewConfig()
-	cfg.WorkDir = t.TempDir()
-
-	env := newTestProcessorEnv(t, cfg, &mockInferenceClient{})
-
-	jobID := "partial-empty"
-	tenantID := "tenant__tenantA"
-
-	jobDir, err := env.p.jobRootDir(jobID, tenantID)
-	if err != nil {
-		t.Fatalf("jobRootDir: %v", err)
-	}
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	outputPath, _ := env.p.jobOutputFilePath(jobID, tenantID)
-	if err := os.WriteFile(outputPath, []byte{}, 0o644); err != nil {
-		t.Fatalf("WriteFile output: %v", err)
-	}
-	errorPath, _ := env.p.jobErrorFilePath(jobID, tenantID)
-	if err := os.WriteFile(errorPath, []byte{}, 0o644); err != nil {
-		t.Fatalf("WriteFile error: %v", err)
-	}
-
-	jobInfo := &batch_types.JobInfo{JobID: jobID, TenantID: tenantID}
-	dbJob := &db.BatchItem{
-		BaseIndexes: db.BaseIndexes{ID: jobID, TenantID: tenantID, Tags: db.Tags{}},
-	}
-
-	ctx := testLoggerCtx(t)
-	outputFileID, errorFileID := env.p.uploadPartialResults(ctx, jobInfo, dbJob)
-
-	if outputFileID != "" {
-		t.Fatalf("outputFileID = %q, want empty (output file was 0 bytes)", outputFileID)
-	}
-	if errorFileID != "" {
-		t.Fatalf("errorFileID = %q, want empty (error file was 0 bytes)", errorFileID)
-	}
-}
-
-// TestUploadPartialResults_MissingFiles verifies that when neither output nor error
-// files exist on disk, uploadPartialResults returns empty file IDs without error.
-func TestUploadPartialResults_MissingFiles(t *testing.T) {
-	cfg := config.NewConfig()
-	cfg.WorkDir = t.TempDir()
-
-	env := newTestProcessorEnv(t, cfg, &mockInferenceClient{})
-
-	jobID := "partial-missing"
-	tenantID := "tenant__tenantA"
-
-	jobDir, err := env.p.jobRootDir(jobID, tenantID)
-	if err != nil {
-		t.Fatalf("jobRootDir: %v", err)
-	}
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-
-	jobInfo := &batch_types.JobInfo{JobID: jobID, TenantID: tenantID}
-	dbJob := &db.BatchItem{
-		BaseIndexes: db.BaseIndexes{ID: jobID, TenantID: tenantID, Tags: db.Tags{}},
-	}
-
-	ctx := testLoggerCtx(t)
-	outputFileID, errorFileID := env.p.uploadPartialResults(ctx, jobInfo, dbJob)
-
-	if outputFileID != "" {
-		t.Fatalf("outputFileID = %q, want empty (output file does not exist)", outputFileID)
-	}
-	if errorFileID != "" {
-		t.Fatalf("errorFileID = %q, want empty (error file does not exist)", errorFileID)
-	}
-}
-
-// TestUploadPartialResults_OneUploadFails_OtherSurvives verifies that when one of the two
-// parallel uploads fails, the other file ID is still returned. uploadPartialResults is
-// best-effort: one-side failure must not lose the other side's reference.
-func TestUploadPartialResults_OneUploadFails_OtherSurvives(t *testing.T) {
-	cfg := config.NewConfig()
-	cfg.WorkDir = t.TempDir()
-
-	dbClient := newMockBatchDBClient()
-	filesClient := &failOnNthCallClient{
-		failN:   1,
-		failErr: errors.New("injected: one-side upload failure"),
-	}
-
-	clients := &clientset.Clientset{
-		BatchDB:   dbClient,
-		FileDB:    newMockFileDBClient(),
-		File:      filesClient,
-		Queue:     mockdb.NewMockBatchPriorityQueueClient(),
-		Inference: inference.NewSingleClientResolver(&fakeInferenceClient{}),
-	}
-	p := mustNewProcessor(t, cfg, clients)
-	p.poller = NewPoller(clients.Queue, dbClient)
-
-	jobID := "partial-one-side"
-	tenantID := "tenant__tenantA"
-
-	jobDir, err := p.jobRootDir(jobID, tenantID)
-	if err != nil {
-		t.Fatalf("jobRootDir: %v", err)
-	}
-	if err := os.MkdirAll(jobDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	outputPath, _ := p.jobOutputFilePath(jobID, tenantID)
-	if err := os.WriteFile(outputPath, []byte(`{"custom_id":"r1"}`+"\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile output: %v", err)
-	}
-	errorPath, _ := p.jobErrorFilePath(jobID, tenantID)
-	if err := os.WriteFile(errorPath, []byte(`{"custom_id":"e1"}`+"\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile error: %v", err)
-	}
-
-	jobInfo := &batch_types.JobInfo{JobID: jobID, TenantID: tenantID}
-	dbJob := seedDBJob(t, dbClient, jobID)
-
-	ctx := testLoggerCtx(t)
-	outputFileID, errorFileID := p.uploadPartialResults(ctx, jobInfo, dbJob)
-
-	// Exactly one of the two uploads failed (the first call to Store).
-	// The other must have succeeded and returned a non-empty file ID.
-	nonEmpty := 0
-	if outputFileID != "" {
-		nonEmpty++
-	}
-	if errorFileID != "" {
-		nonEmpty++
-	}
-	if nonEmpty != 1 {
-		t.Fatalf("expected exactly 1 surviving file ID (one upload failed), got output=%q error=%q",
-			outputFileID, errorFileID)
-	}
-}
 
 // =====================================================================
 // Tests: cleanupJobArtifacts

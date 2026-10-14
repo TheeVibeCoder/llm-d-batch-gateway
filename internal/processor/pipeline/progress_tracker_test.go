@@ -2,10 +2,13 @@ package pipeline
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-logr/logr"
+
+	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 )
 
 func TestProgressTracker_Run(t *testing.T) {
@@ -61,4 +64,30 @@ func TestProgressTracker_Run(t *testing.T) {
 			}
 		})
 	}
+}
+
+type countingUpdater struct {
+	mu    sync.Mutex
+	calls int
+	last  *openai.BatchRequestCounts
+}
+
+func (u *countingUpdater) UpdateProgressCounts(_ context.Context, _ string, counts *openai.BatchRequestCounts) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.calls++
+	u.last = counts
+	return nil
+}
+
+func (u *countingUpdater) getCalls() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.calls
+}
+
+func (u *countingUpdater) getLast() *openai.BatchRequestCounts {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.last
 }

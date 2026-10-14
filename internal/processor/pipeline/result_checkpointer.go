@@ -18,6 +18,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -51,8 +52,6 @@ type ResultCheckpointer struct {
 	logger               logr.Logger
 	onPersistenceFailure func()
 }
-
-var _ resultHandler = (*ResultCheckpointer)(nil)
 
 func NewResultCheckpointer(sink ResultSink, pending *PendingRequests, tracker *ProgressTracker, logger logr.Logger) *ResultCheckpointer {
 	return &ResultCheckpointer{
@@ -147,4 +146,38 @@ func (c *ResultCheckpointer) record(msg ResultItem) {
 	}
 	c.tracker.RecordFailure(fmt.Errorf("%s: %s", msg.RequestID, msg.ErrorCode()))
 	metrics.RecordRequestError(msg.ModelID)
+}
+
+func recordTokenUsage(body map[string]any, model string, logger logr.Logger) {
+	usage, ok := body["usage"].(map[string]any)
+	if !ok {
+		return
+	}
+	prompt, pOK := toFloat64(usage["prompt_tokens"])
+	completion, cOK := toFloat64(usage["completion_tokens"])
+	if !pOK && !cOK {
+		return
+	}
+	if prompt < 0 || completion < 0 {
+		logger.Info("Negative token values, skipping metrics",
+			"prompt_tokens", prompt, "completion_tokens", completion)
+		return
+	}
+	metrics.RecordTokenUsage(prompt, completion, model)
+}
+
+func toFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	default:
+		return 0, false
+	}
 }

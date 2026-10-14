@@ -141,24 +141,6 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 		}
 	}
 
-	// Always truncate error.jsonl at the start of ingestion so that re-enqueued
-	// jobs don't carry stale error entries from a previous attempt.
-	// Execution opens the same file in append mode.
-	// In global mode this creates an empty file that finalization omits (size 0).
-	errorFilePath, err := p.jobErrorFilePath(jobID, jobInfo.TenantID)
-	if err != nil {
-		return nil, err
-	}
-	errorFile, err := os.OpenFile(errorFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create error file: %w", err)
-	}
-	errorWriter := bufio.NewWriter(errorFile)
-	defer func() {
-		_ = errorWriter.Flush()
-		errorFile.Close()
-	}()
-
 	var offset int64
 	var lineCount int64 // to count the number of lines in the input file for logging
 	var rejectedCount int64
@@ -218,9 +200,6 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 					return nil, fmt.Errorf("failed to marshal model_not_found error: %w", marshalErr)
 				}
 				lineBytes = append(lineBytes, '\n')
-				if _, writeErr := errorWriter.Write(lineBytes); writeErr != nil {
-					return nil, fmt.Errorf("failed to write model_not_found error: %w", writeErr)
-				}
 				rejectedCount++
 				manifest.add(rejectedEntry(jobID, lineCount-1, requestMeta.CustomID, requestID,
 					inference.ErrCodeModelNotFound, lineBytes))

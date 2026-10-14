@@ -67,11 +67,11 @@ func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionPar
 		return nil, fmt.Errorf("read model map: %w", err)
 	}
 
-	files, err := p.openDataFiles(params)
+	inputFile, err := p.openInputFile(params)
 	if err != nil {
 		return nil, err
 	}
-	defer files.close()
+	defer inputFile.Close()
 
 	plansDir, err := p.jobPlansDir(params.jobInfo.JobID, params.jobInfo.TenantID)
 	if err != nil {
@@ -107,7 +107,7 @@ func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionPar
 	tracker.AddFailed(modelMap.RejectedCount)
 
 	sourceCfg := PlanFileSourceConfig{
-		InputFile:          files.input,
+		InputFile:          inputFile,
 		PlansDir:           plansDir,
 		ModelMap:           modelMap,
 		Resolver:           p.inference,
@@ -193,20 +193,10 @@ func (p *Processor) buildRequestDispatcher(ctx context.Context, modelMap *modelM
 	return pipeline.NewPreDispatcher(aimd).WithBeforeSubmit(fence), nil
 }
 
-type dataFiles struct {
-	input *os.File
-}
-
-func (f *dataFiles) close() {
-	if f.input != nil {
-		_ = f.input.Close()
-	}
-}
-
-// openDataFiles opens the preprocessed input file. Results are checkpointed
+// openInputFile opens the preprocessed input file. Results are checkpointed
 // to the result store and finalization streams the artifacts from there —
 // no local output files are kept.
-func (p *Processor) openDataFiles(params *jobExecutionParams) (*dataFiles, error) {
+func (p *Processor) openInputFile(params *jobExecutionParams) (*os.File, error) {
 	inputPath, err := p.jobInputFilePath(params.jobInfo.JobID, params.jobInfo.TenantID)
 	if err != nil {
 		return nil, err
@@ -215,7 +205,7 @@ func (p *Processor) openDataFiles(params *jobExecutionParams) (*dataFiles, error
 	if err != nil {
 		return nil, fmt.Errorf("open input file: %w", err)
 	}
-	return &dataFiles{input: inputFile}, nil
+	return inputFile, nil
 }
 
 // buildAIMDModels keys per-endpoint concurrency state by route key: dispatch
