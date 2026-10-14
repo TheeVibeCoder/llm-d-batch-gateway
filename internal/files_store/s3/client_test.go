@@ -762,3 +762,38 @@ func TestOpenStream(t *testing.T) {
 		}
 	})
 }
+
+func TestOpenStream_AbortAfterFailedCommitDoesNotHang(t *testing.T) {
+	ctx := context.Background()
+	mock := newMockS3Client()
+	// Force the upload to fail so Commit consumes the error result.
+	client := &Client{
+		s3Client: mock,
+		uploader: &mockUploader{s3Client: mock, uploadErr: errors.New("injected upload failure")},
+		prefix:   "",
+		bucket:   testBucketName,
+	}
+
+	w, err := client.OpenStream(ctx, "out.jsonl", testFolderName)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// The failed upload breaks the pipe, so the write error is expected.
+	_, _ = w.Write([]byte("data"))
+	if _, err := w.Commit(ctx); err == nil {
+		t.Fatal("expected commit to fail")
+	}
+
+	// The caller's cleanup Abort must not block on the already-consumed
+	// result channel (the upload goroutine sends exactly one value).
+	done := make(chan error, 1)
+	go func() { done <- w.Abort(ctx) }()
+	// The only property that matters here: Abort returns instead of
+	// blocking on the already-consumed result channel. Its error value is
+	// irrelevant — the stream already failed.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Abort blocked after Commit consumed the result channel")
+	}
+}
