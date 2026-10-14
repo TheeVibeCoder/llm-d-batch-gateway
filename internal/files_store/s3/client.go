@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -32,6 +33,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 	fsio "github.com/llm-d/llm-d-batch-gateway/internal/files_store/io"
@@ -211,9 +213,20 @@ func (c *Client) Store(ctx context.Context, fileName, folderName string, fileSiz
 		Bucket: aws.String(c.bucket),
 		Key:    aws.String(key),
 		Body:   countingReader,
+		// Conditional create: fail instead of overwriting an object that
+		// appeared after the HeadObject check, so the create-only contract
+		// holds even when two writers race. (Multipart uploads do not
+		// enforce the condition, but the objects written through this path
+		// are single JSONL lines, far below the manager's part size.)
+		IfNoneMatch: aws.String("*"),
 	})
 	if err != nil {
+		// This SDK version surfaces the 412 only as an error code, not a
+		// typed error.
+		var apiErr smithy.APIError
 		switch {
+		case errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed":
+			return nil, fmt.Errorf("%w: %s", api.ErrFileExists, key)
 		case errors.Is(err, api.ErrFileTooLarge):
 			return nil, api.ErrFileTooLarge
 		case errors.Is(err, api.ErrTooManyLines):
@@ -286,6 +299,7 @@ func (c *Client) OpenStream(ctx context.Context, fileName, folderName string) (a
 type s3StreamWriter struct {
 	pw     *io.PipeWriter
 	done   chan error
+	mu     sync.Mutex
 	bucket string
 	key    string
 	bytes  int64
@@ -303,7 +317,7 @@ func (w *s3StreamWriter) Commit(ctx context.Context) (*api.BatchFileMetadata, er
 	if err := w.pw.Close(); err != nil {
 		return nil, err
 	}
-	if err := <-w.done; err != nil {
+	if err := w.result(); err != nil {
 		return nil, err
 	}
 
@@ -320,10 +334,24 @@ func (w *s3StreamWriter) Commit(ctx context.Context) (*api.BatchFileMetadata, er
 func (w *s3StreamWriter) Abort(ctx context.Context) error {
 	// Failing the body read aborts the upload.
 	_ = w.pw.CloseWithError(errStreamAborted)
-	if err := <-w.done; err == nil {
+	if err := w.result(); err == nil {
 		return fmt.Errorf("stream aborted but object %s was already uploaded", w.key)
 	}
 	return nil
+}
+
+// result consumes the upload outcome exactly once: the goroutine sends a
+// single value and never closes the channel, so a second receive — Commit
+// followed by the caller's cleanup Abort — would block forever.
+func (w *s3StreamWriter) result() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.done == nil {
+		return errStreamAborted
+	}
+	err := <-w.done
+	w.done = nil
+	return err
 }
 
 // Retrieve retrieves a file from S3.

@@ -162,8 +162,13 @@ func (c *Client) Store(ctx context.Context, fileName, folderName string, fileSiz
 		ModTime:     info.ModTime(),
 	}
 
-	// Rename temp file to final destination as the last operation.
-	if err := c.root.Rename(tmpName, relPath); err != nil {
+	// Link the temp file into place as the last operation: unlike rename,
+	// a hard link fails when the destination exists, so the create-only
+	// contract holds even when the earlier Stat raced another writer.
+	if err := c.root.Link(tmpName, relPath); err != nil {
+		if errors.Is(err, iofs.ErrExist) {
+			return nil, fmt.Errorf("%w: %s", api.ErrFileExists, relPath)
+		}
 		return nil, err
 	}
 

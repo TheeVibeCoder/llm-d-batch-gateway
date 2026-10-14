@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
+	filesapi "github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 )
 
 // Compile-time check: MockBatchFilesClient implements api.BatchFilesClient.
@@ -115,8 +116,13 @@ func (m *MockBatchFilesClient) Store(ctx context.Context, fileName, folderName s
 		return nil, fmt.Errorf("failed to get file info: %w", err)
 	}
 
-	// Rename temp file to final destination as the last operation.
-	if err := os.Rename(tmpName, filePath); err != nil {
+	// Link the temp file into place as the last operation: unlike rename,
+	// a hard link fails when the destination exists, so the create-only
+	// contract holds even when two writers race.
+	if err := os.Link(tmpName, filePath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("%w: %s", filesapi.ErrFileExists, location)
+		}
 		return nil, fmt.Errorf("failed to store file: %w", err)
 	}
 

@@ -20,12 +20,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
+	filesapi "github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 )
 
 func newTestClient(t *testing.T) *MockBatchFilesClient {
@@ -85,7 +87,7 @@ func TestStore(t *testing.T) {
 		if _, err := client.Store(ctx, "out.jsonl", "folder", 0, 0, bytes.NewReader(content)); err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
-		if _, err := client.Store(ctx, "out.jsonl", "folder", 0, 0, bytes.NewReader(content)); !errors.Is(err, api.ErrFileExists) {
+		if _, err := client.Store(ctx, "out.jsonl", "folder", 0, 0, bytes.NewReader(content)); !errors.Is(err, filesapi.ErrFileExists) {
 			t.Errorf("expected ErrFileExists, got %v", err)
 		}
 	})
@@ -167,7 +169,7 @@ func TestOpenStream(t *testing.T) {
 			t.Fatalf("commit failed: %v", err)
 		}
 
-		if _, err := client.OpenStream(ctx, "out.jsonl", "folder"); !errors.Is(err, api.ErrFileExists) {
+		if _, err := client.OpenStream(ctx, "out.jsonl", "folder"); !errors.Is(err, filesapi.ErrFileExists) {
 			t.Errorf("expected ErrFileExists, got %v", err)
 		}
 	})
@@ -231,4 +233,50 @@ func TestDeletePrefix(t *testing.T) {
 			t.Errorf("deleted = %d, want 0", deleted)
 		}
 	})
+}
+
+// TestMockStore_CreateOnlyUnderRace proves two concurrent writers of the
+// same key cannot clobber each other: exactly one object is committed and
+// the loser observes ErrFileExists, matching the production stores'
+// conditional-create contract.
+func TestMockStore_CreateOnlyUnderRace(t *testing.T) {
+	client := NewMockBatchFilesClient(t.TempDir())
+
+	const writers = 8
+	results := make(chan error, writers)
+	for i := range writers {
+		i := i
+		go func() {
+			_, err := client.Store(context.Background(), "same-key.jsonl", "folder", 0, 0,
+				strings.NewReader(fmt.Sprintf("writer-%d\n", i)))
+			results <- err
+		}()
+	}
+
+	var succeeded, exists int
+	for range writers {
+		if err := <-results; err == nil {
+			succeeded++
+		} else if errors.Is(err, filesapi.ErrFileExists) {
+			exists++
+		} else {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if succeeded != 1 || exists != writers-1 {
+		t.Fatalf("succeeded=%d exists=%d, want 1/%d", succeeded, exists, writers-1)
+	}
+
+	reader, _, err := client.Retrieve(context.Background(), "same-key.jsonl", "folder")
+	if err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.HasSuffix(string(data), "\n") || len(data) != len("writer-N\n") {
+		t.Fatalf("stored object holds partial or duplicated content: %q", data)
+	}
 }
