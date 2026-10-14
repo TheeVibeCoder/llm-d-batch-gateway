@@ -153,9 +153,6 @@ func (m *MockResumableStore) ActivateResumableBatch(ctx context.Context, activat
 			ResultSHA256: e.ResultSHA256,
 			ErrorCode:    e.ErrorCode,
 		}
-		if entry.Status == api.ResumableEntryFailed {
-			entry.Attempts = 1
-		}
 		b.entries = append(b.entries, entry)
 	}
 	sort.Slice(b.entries, func(i, j int) bool { return b.entries[i].Ordinal < b.entries[j].Ordinal })

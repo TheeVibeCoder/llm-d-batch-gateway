@@ -111,7 +111,11 @@ func (c *PostgresResumableStore) ActivateResumableBatch(ctx context.Context, act
 			INSERT INTO batch_entries (batch_id, request_id, ordinal, custom_id, status, attempts,
 				result_key, result_bytes, result_sha256, error_code, completed_at)
 			SELECT $1, r.request_id, r.ordinal, r.custom_id, r.status,
-				CASE WHEN r.status = 'failed' THEN 1 ELSE 0 END,
+				-- attempts counts dispatch attempts; an activation-rejected
+				-- line is never dispatched, so it seeds 0 — the manifest
+				-- integrity check relies on this to tell a rejection (failed
+				-- with zero attempts) from an attempted failure.
+				0,
 				r.result_key, r.result_bytes, r.result_sha256, r.error_code,
 				CASE WHEN r.status = 'failed' THEN NOW() END
 			FROM candidate, jsonb_to_recordset($4::jsonb) AS r(request_id TEXT, ordinal BIGINT,

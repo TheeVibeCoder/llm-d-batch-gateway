@@ -446,7 +446,7 @@ func TestMockResumableStore_Queries(t *testing.T) {
 		if err != nil || entry == nil {
 			t.Fatalf("find r-3: err=%v entry=%v", err, entry)
 		}
-		if entry.Status != api.ResumableEntryFailed || entry.Attempts != 1 ||
+		if entry.Status != api.ResumableEntryFailed || entry.Attempts != 0 ||
 			entry.ErrorCode != "model_not_found" || entry.ResultKey != "results/job-1/r-3.jsonl" ||
 			entry.ResultBytes != 42 || entry.ResultSHA256 != "abc123" {
 			t.Fatalf("rejected entry = %+v", entry)

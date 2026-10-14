@@ -1647,3 +1647,85 @@ func TestAssembleResumableArtifacts_PrefetchesConcurrently(t *testing.T) {
 		t.Fatalf("artifact = %q, want %q (ordinal order)", data, want)
 	}
 }
+
+// rejectedLineEntry stores the error object of an ingestion-rejected line
+// (unregistered model) at its canonical key — activation does this in the
+// real flow — and returns the activation entry that commits it. The entry
+// has zero attempts: a rejection was never dispatched.
+func rejectedLineEntry(t *testing.T, env *durableJobEnv, jobID, customID string, ordinal int64) db.ResumableActivationEntry {
+	t.Helper()
+	reqID := stableBatchRequestID(jobID, customID)
+	errLine := fmt.Sprintf(`{"id":%q,"custom_id":%q,"error":{"code":"model_not_found","message":"model missing-model is not configured in any gateway"}}`+"\n",
+		reqID, customID)
+	folder, err := ucom.GetFolderNameByTenantID(env.jobInfo.TenantID)
+	if err != nil {
+		t.Fatalf("GetFolderNameByTenantID: %v", err)
+	}
+	key := resumableResultKey(jobID, reqID)
+	if _, err := env.filesClient.Store(testLoggerCtx(t), key, folder, 0, 0, bytes.NewReader([]byte(errLine))); err != nil {
+		t.Fatalf("store rejected error object %s: %v", key, err)
+	}
+	sum := sha256.Sum256([]byte(errLine))
+	return db.ResumableActivationEntry{
+		RequestID:    reqID,
+		Ordinal:      ordinal,
+		CustomID:     customID,
+		Status:       string(db.ResumableEntryFailed),
+		ErrorCode:    "model_not_found",
+		ResultKey:    key,
+		ResultBytes:  int64(len(errLine)),
+		ResultSHA256: hex.EncodeToString(sum[:]),
+	}
+}
+
+// TestRunJob_Resumable_ResumeWithRejectedEntries guards the manifest
+// integrity contract for ingestion-rejected lines: a rejection is a failed
+// entry with zero attempts (never dispatched), so a requeued batch holding
+// rejected lines must resume instead of failing the integrity check.
+func TestRunJob_Resumable_ResumeWithRejectedEntries(t *testing.T) {
+	const jobID = "job-resumable-rejected-resume"
+
+	env := setupDurableJob(t, jobID, []string{"test-model", "missing-model"})
+
+	env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress})
+	env.jobItem.Epoch = 2
+	if err := env.dbClient.DBStore(testLoggerCtx(t), env.jobItem); err != nil {
+		t.Fatalf("DBStore job item: %v", err)
+	}
+	env.stageResumedClaim(t, 2,
+		pendingLineEntry(jobID, "req-1", 0),
+		rejectedLineEntry(t, env, jobID, "req-2", 1),
+	)
+
+	done := env.runResumedJobAsync(t, &db.BatchJobPriority{
+		ID:        jobID,
+		SLO:       time.Now().Add(1 * time.Hour),
+		Epoch:     2,
+		Resumable: true,
+	})
+	go func() {
+		for {
+			select {
+			case req := <-env.asyncClient.submittedCh:
+				env.asyncClient.deliver(req.RequestID, map[string]any{"choices": []any{map[string]any{"text": "ok"}}})
+			case <-done:
+				return
+			}
+		}
+	}()
+	<-done
+
+	status := durableJobStatus(t, env)
+	if status.Status != openai.BatchStatusCompleted {
+		t.Fatalf("status = %s, want completed", status.Status)
+	}
+	wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 1, Failed: 1}
+	if status.RequestCounts != wantCounts {
+		t.Fatalf("counts = %+v, want %+v", status.RequestCounts, wantCounts)
+	}
+	// Only the pending entry is (re-)dispatched; the rejected one is
+	// already terminal.
+	if got := env.asyncClient.submitCount(); got != 1 {
+		t.Fatalf("submitted requests = %d, want 1", got)
+	}
+}

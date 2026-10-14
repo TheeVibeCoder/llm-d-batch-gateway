@@ -171,7 +171,7 @@ func TestActivateResumableBatchPG(t *testing.T) {
 		rejected := entries[2]
 		if rejected.Status != api.ResumableEntryFailed || rejected.ErrorCode != "model_not_found" ||
 			rejected.ResultKey != "results/j1/batch_req_r.jsonl" || rejected.ResultBytes != 42 ||
-			rejected.ResultSHA256 != "sha-r" || rejected.Attempts != 1 {
+			rejected.ResultSHA256 != "sha-r" || rejected.Attempts != 0 {
 			t.Fatalf("rejected entry not persisted with its error object: %+v", rejected)
 		}
 	})
