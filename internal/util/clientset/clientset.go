@@ -48,6 +48,7 @@ type Clientset struct {
 	Queue           dbapi.BatchPriorityQueueClient
 	Event           dbapi.BatchEventChannelClient
 	EventGC         dbapi.BatchEventGC
+	Resumable       dbapi.ResumableStore
 	Inference       *inference.GatewayResolver
 	AsyncInference  *inference.AsyncGatewayResolver
 }
@@ -228,6 +229,17 @@ func NewClientset(ctx context.Context, component ucom.Component, opts ...Option)
 			}
 			cs.Queue = queueClient
 
+			// The resumable store serves the processor (activation, leases,
+			// entry writes) and the GC (orphan requeue); the apiserver has no
+			// resumable role.
+			if component == ucom.ComponentProcessor || component == ucom.ComponentGC {
+				resumable, err := postgresql.NewPostgresResumableStore(ctx, &cfg.dbCfg.PostgreSQLCfg)
+				if err != nil {
+					return nil, fmt.Errorf("failed to create postgres resumable store: %w", err)
+				}
+				cs.Resumable = resumable
+			}
+
 			var eventClient dbapi.BatchEventChannelClient
 			switch component {
 			case ucom.ComponentProcessor:
@@ -295,6 +307,11 @@ func (cs *Clientset) Close() error {
 	}
 	if cs.Event != nil {
 		if err := cs.Event.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if cs.Resumable != nil {
+		if err := cs.Resumable.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

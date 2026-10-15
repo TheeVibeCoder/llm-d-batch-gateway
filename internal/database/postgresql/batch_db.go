@@ -33,15 +33,18 @@ var batchSchemaSql string
 
 // nonTerminalCondition is the SQL WHERE clause fragment that filters for
 // non-terminal batch statuses. Computed once since terminal statuses are fixed.
-var nonTerminalCondition = buildNonTerminalCondition()
+var nonTerminalCondition = buildNonTerminalCondition(colStatus)
 
-func buildNonTerminalCondition() string {
+// buildNonTerminalCondition builds the fragment against the given status
+// column reference, letting a caller qualify it (e.g. "b.status") when the
+// query joins another table that also has a status column.
+func buildNonTerminalCondition(column string) string {
 	statuses := openai.TerminalStatuses()
 	quoted := make([]string, len(statuses))
 	for i, s := range statuses {
 		quoted[i] = "'" + string(s) + "'"
 	}
-	return colStatus + `::jsonb->>'status' NOT IN (` + strings.Join(quoted, ",") + `)`
+	return column + `::jsonb->>'status' NOT IN (` + strings.Join(quoted, ",") + `)`
 }
 
 const (

@@ -75,3 +75,39 @@ CREATE TABLE IF NOT EXISTS batch_events (
 );
 CREATE INDEX IF NOT EXISTS idx_batch_events_job_id ON batch_events (job_id, id);
 CREATE INDEX IF NOT EXISTS idx_batch_events_expires_at ON batch_events (expires_at);
+
+-- Resumable ownership rides on processor_id (set at dequeue for every
+-- claimed row); the lease set at activation/reclaim distinguishes a resumable
+-- owner from a mere queue claim, so entry writes fence on the pair.
+ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS owner_lease_expires_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_batch_items_resumable_lease
+    ON batch_items (owner_lease_expires_at) WHERE resumable = TRUE;
+-- Requeued resumable rows waiting to be re-claimed by PQDequeue.
+CREATE INDEX IF NOT EXISTS idx_batch_items_queue_resumable
+    ON batch_items (priority ASC)
+    WHERE processor_id IS NULL AND resumable = TRUE;
+
+-- One metadata row per request of a resumable batch. No payloads: bodies and
+-- results live only in the file store.
+CREATE TABLE IF NOT EXISTS batch_entries (
+    batch_id      TEXT        NOT NULL,
+    request_id    TEXT        NOT NULL,
+    ordinal       BIGINT      NOT NULL,
+    custom_id     TEXT        NOT NULL,
+    status        TEXT        NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','in_flight','completed','failed')),
+    attempts      BIGINT      NOT NULL DEFAULT 0,
+    result_key    TEXT,
+    result_bytes  BIGINT,
+    result_sha256 TEXT,
+    error_code    TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at  TIMESTAMPTZ,
+    PRIMARY KEY (batch_id, request_id),
+    CONSTRAINT fk_batch_entries_batch FOREIGN KEY (batch_id)
+        REFERENCES batch_items(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_batch_entries_ordinal ON batch_entries (batch_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_batch_entries_open
+    ON batch_entries (batch_id) WHERE status IN ('pending','in_flight');

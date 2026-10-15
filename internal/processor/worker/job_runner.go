@@ -166,7 +166,9 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 
 	// ingestion: pre-process job (rejects unregistered-model requests early)
 	ingestCtx, ingestSpan := uotel.StartSpan(abortCtx, "ingest-and-plan")
-	err = p.preProcessJob(ingestCtx, params.jobInfo)
+	// The manifest feeds resumable activation (wired in a follow-up change);
+	// the legacy pipeline ignores it.
+	_, err = p.preProcessJob(ingestCtx, params.jobInfo)
 	if err != nil && !batchctx.IsTerminal(err) {
 		ingestSpan.RecordError(err)
 		ingestSpan.SetStatus(codes.Error, "pre-process failed")

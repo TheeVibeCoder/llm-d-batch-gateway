@@ -154,6 +154,22 @@ type AsyncDispatchConfig struct {
 	Models map[string]AsyncModelConfig `yaml:"models"`
 }
 
+// ResumableConfig holds the tunables of the resumable pipeline that async
+// dispatch runs on. There is no enabled flag: resumable is the only
+// implementation of async dispatch.
+type ResumableConfig struct {
+	// LeaseDuration is the ownership lease an activated batch holds in
+	// Postgres; the owner renews it at half this interval.
+	LeaseDuration time.Duration `yaml:"lease_duration"`
+
+	// FinalizeConcurrency bounds the parallel result-object fetches during
+	// resumable finalization.
+	FinalizeConcurrency int `yaml:"finalize_concurrency"`
+
+	// FinalizeTimeout bounds the finalization phase of one batch.
+	FinalizeTimeout time.Duration `yaml:"finalize_timeout"`
+}
+
 type ProcessorConfig struct {
 	// ExtraEndpoints adds deployment-specific inference paths to the default OpenAI endpoint allowlist.
 	ExtraEndpoints []string `yaml:"extra_endpoints"`
@@ -260,6 +276,10 @@ type ProcessorConfig struct {
 
 	// AsyncDispatchConfig holds llm-d-async dispatch settings. Only used when DispatchMode == "async".
 	AsyncDispatchConfig AsyncDispatchConfig `yaml:"async_dispatch"`
+
+	// Resumable holds the tunables of the resumable pipeline that async
+	// dispatch runs on.
+	Resumable ResumableConfig `yaml:"resumable"`
 }
 
 // ModelGatewayConfig describes the full gateway and HTTP/TLS settings for one
@@ -408,6 +428,11 @@ func NewConfig() *ProcessorConfig {
 		AsyncDispatchConfig: AsyncDispatchConfig{
 			ResultPollTimeout: 5 * time.Second,
 		},
+		Resumable: ResumableConfig{
+			LeaseDuration:       5 * time.Minute,
+			FinalizeConcurrency: 16,
+			FinalizeTimeout:     30 * time.Minute,
+		},
 	}
 }
 
@@ -457,6 +482,18 @@ func (c *ProcessorConfig) Validate() error {
 	}
 	if _, err := openai.NewEndpointAllowlist(c.ExtraEndpoints); err != nil {
 		return fmt.Errorf("extra_endpoints: %w", err)
+	}
+
+	// The lease is persisted in Postgres as whole seconds; a sub-second
+	// duration truncates to an already-expired lease.
+	if c.Resumable.LeaseDuration < time.Second || c.Resumable.LeaseDuration%time.Second != 0 {
+		return fmt.Errorf("resumable.lease_duration must be a whole number of seconds >= 1s, got %s", c.Resumable.LeaseDuration)
+	}
+	if c.Resumable.FinalizeConcurrency <= 0 {
+		return fmt.Errorf("resumable.finalize_concurrency must be > 0")
+	}
+	if c.Resumable.FinalizeTimeout <= 0 {
+		return fmt.Errorf("resumable.finalize_timeout must be > 0")
 	}
 
 	switch c.RouteKeyMethod {

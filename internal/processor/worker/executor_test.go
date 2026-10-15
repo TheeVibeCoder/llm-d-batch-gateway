@@ -197,7 +197,7 @@ func TestConfiguredEndpointReachesInferenceClientUnchanged(t *testing.T) {
 				TenantID: tenantID,
 			}
 
-			if err := p.preProcessJob(ctx, jobInfo); err != nil {
+			if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 				t.Fatalf("preProcessJob() error = %v", err)
 			}
 			counts, err := p.executeJob(ctx, &jobExecutionParams{

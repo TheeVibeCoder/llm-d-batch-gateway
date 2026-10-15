@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
+
 	"github.com/llm-d/llm-d-batch-gateway/internal/shared/openai"
 	batch_types "github.com/llm-d/llm-d-batch-gateway/internal/shared/types"
 )
@@ -47,6 +49,13 @@ const (
 // OpenAI Batch API for output/error line IDs.
 func newBatchRequestID(requestID string) string {
 	return fmt.Sprintf("batch_req_%s", requestID)
+}
+
+// stableBatchRequestID derives a deterministic request ID from the batch and
+// custom IDs, so re-preprocessing the same input yields the same request IDs.
+func stableBatchRequestID(batchID, customID string) string {
+	u := uuid.NewSHA1(uuid.NameSpaceOID, []byte(batchID+"\x00"+customID))
+	return newBatchRequestID(u.String())
 }
 
 // Deprecated: executeJob delegates to executeJobAsync. Kept so existing

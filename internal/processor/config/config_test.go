@@ -113,6 +113,56 @@ func TestNewConfig_Defaults(t *testing.T) {
 	if c.AsyncDispatchConfig.ResultPollTimeout != 5*time.Second {
 		t.Fatalf("AsyncDispatchConfig.ResultPollTimeout = %v, want %v", c.AsyncDispatchConfig.ResultPollTimeout, 5*time.Second)
 	}
+	if c.Resumable.LeaseDuration != 5*time.Minute {
+		t.Fatalf("Resumable.LeaseDuration = %v, want %v", c.Resumable.LeaseDuration, 5*time.Minute)
+	}
+	if c.Resumable.FinalizeConcurrency != 16 {
+		t.Fatalf("Resumable.FinalizeConcurrency = %d, want 16", c.Resumable.FinalizeConcurrency)
+	}
+	if c.Resumable.FinalizeTimeout != 30*time.Minute {
+		t.Fatalf("Resumable.FinalizeTimeout = %v, want %v", c.Resumable.FinalizeTimeout, 30*time.Minute)
+	}
+}
+
+func TestProcessorConfig_Validate_Resumable(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*ResumableConfig)
+		wantErr bool
+	}{
+		{name: "defaults are valid", mutate: func(*ResumableConfig) {}},
+		{name: "zero lease duration", mutate: func(r *ResumableConfig) { r.LeaseDuration = 0 }, wantErr: true},
+		{name: "negative lease duration", mutate: func(r *ResumableConfig) { r.LeaseDuration = -time.Second }, wantErr: true},
+		{name: "sub-second lease duration", mutate: func(r *ResumableConfig) { r.LeaseDuration = 500 * time.Millisecond }, wantErr: true},
+		{name: "non-whole-second lease duration", mutate: func(r *ResumableConfig) { r.LeaseDuration = 1500 * time.Millisecond }, wantErr: true},
+		{name: "zero finalize concurrency", mutate: func(r *ResumableConfig) { r.FinalizeConcurrency = 0 }, wantErr: true},
+		{name: "zero finalize timeout", mutate: func(r *ResumableConfig) { r.FinalizeTimeout = 0 }, wantErr: true},
+		{name: "tuned values are valid", mutate: func(r *ResumableConfig) {
+			r.LeaseDuration = time.Minute
+			r.FinalizeConcurrency = 4
+			r.FinalizeTimeout = 5 * time.Minute
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewConfig()
+			c.DispatchMode = DispatchModeAsync
+			c.AsyncDispatchConfig.Models = map[string]AsyncModelConfig{
+				"model-a": {InferencePoolName: "pool-a"},
+				"model-b": {InferencePoolName: "pool-b"},
+			}
+			c.NumWorkers = 5
+			tt.mutate(&c.Resumable)
+
+			err := c.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatal("Validate() error = nil, want error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Validate() unexpected error: %v", err)
+			}
+		})
+	}
 }
 
 func TestProcessorConfig_Validate_ExtraEndpoints(t *testing.T) {

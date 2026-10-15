@@ -30,8 +30,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/google/uuid"
-
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/processor/batchctx"
@@ -48,7 +46,10 @@ import (
 // error entries for requests targeting unregistered models.
 // The rejected count is persisted in model_map.json so executeJob can
 // seed BatchRequestCounts.Failed without an extra parameter.
-func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobInfo) (err error) {
+// It also accumulates a requestManifest: the per-line metadata (stable
+// request IDs, rejected-line error objects) that resumable activation
+// persists as batch entries.
+func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobInfo) (manifest *requestManifest, err error) {
 	logger := logr.FromContextOrDiscard(ctx)
 	logger.V(logging.INFO).Info("Pre-processing job") // job id is in the logger already
 
@@ -67,23 +68,23 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 	jobID := jobInfo.JobID
 	inputFileID := jobInfo.BatchJob.InputFileID
 	if inputFileID == "" {
-		return fmt.Errorf("input file ID is empty")
+		return nil, fmt.Errorf("input file ID is empty")
 	}
 
 	jobRootDir, err := p.jobRootDir(jobID, jobInfo.TenantID)
 	if err != nil {
-		return fmt.Errorf("resolve job root directory: %w", err)
+		return nil, fmt.Errorf("resolve job root directory: %w", err)
 	}
 
 	// job directory creation
 	if err := os.MkdirAll(jobRootDir, 0o700); err != nil {
-		return fmt.Errorf("create job root directory %q: %w", jobRootDir, err)
+		return nil, fmt.Errorf("create job root directory %q: %w", jobRootDir, err)
 	}
 
 	// input file stream open
 	reader, metadata, err := p.openInputFileStream(ctx, inputFileID)
 	if err != nil {
-		return fmt.Errorf("open input file stream %q: %w", inputFileID, err)
+		return nil, fmt.Errorf("open input file stream %q: %w", inputFileID, err)
 	}
 	defer reader.Close()
 
@@ -94,13 +95,15 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 	// create local input file
 	localInputFile, localInputFilePath, err := p.createLocalInputFile(jobID, jobInfo.TenantID)
 	if err != nil {
-		return fmt.Errorf("create local input file: %w", err)
+		return nil, fmt.Errorf("create local input file: %w", err)
 	}
 	defer localInputFile.Close()
 
 	writer := bufio.NewWriterSize(localInputFile, 1024*1024)
 
 	acc := newPlanAccumulator(jobRootDir)
+
+	manifest = &requestManifest{}
 
 	// model intern tables
 	used := make(map[string]int)           // to prevent duplicate model IDs
@@ -125,11 +128,11 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 	// In global mode this creates an empty file that finalization omits (size 0).
 	errorFilePath, err := p.jobErrorFilePath(jobID, jobInfo.TenantID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	errorFile, err := os.OpenFile(errorFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return fmt.Errorf("failed to create error file: %w", err)
+		return nil, fmt.Errorf("failed to create error file: %w", err)
 	}
 	errorWriter := bufio.NewWriter(errorFile)
 	defer func() {
@@ -147,13 +150,13 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 		// batchctx.Cause maps that to the terminal routing sentinel. First-cause
 		// wins, so a user cancel racing SIGTERM is honoured by whichever fired first.
 		if s := batchctx.Cause(ctx); s != nil {
-			return s
+			return nil, s
 		}
 
 		// read a line from the input file
 		line, done, err := readNormalizedLine(inputFileReader)
 		if err != nil {
-			return fmt.Errorf("read line %d from input file: %w", lineCount+1, err)
+			return nil, fmt.Errorf("read line %d from input file: %w", lineCount+1, err)
 		}
 		if done {
 			break
@@ -163,16 +166,16 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 
 		// write the line to the input file.
 		if _, err := writer.Write(line); err != nil {
-			return fmt.Errorf("write line %d to input file %q: %w", lineCount, localInputFilePath, err)
+			return nil, fmt.Errorf("write line %d to input file %q: %w", lineCount, localInputFilePath, err)
 		}
 
 		requestMeta, err := extractAndValidateLine(line, p.endpointAllowlist, jobInfo.BatchJob.Endpoint.String())
 		if err != nil {
-			return fmt.Errorf("validate request at line %d: %w", lineCount, err)
+			return nil, fmt.Errorf("validate request at line %d: %w", lineCount, err)
 		}
 
 		if _, exists := seenCustomIDs[requestMeta.CustomID]; exists {
-			return fmt.Errorf("line %d: duplicate custom_id %q", lineCount, requestMeta.CustomID)
+			return nil, fmt.Errorf("line %d: duplicate custom_id %q", lineCount, requestMeta.CustomID)
 		}
 		seenCustomIDs[requestMeta.CustomID] = struct{}{}
 
@@ -187,10 +190,12 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 				registeredModels[lookupID] = registered
 			}
 			if !registered {
-				// No plan entry exists yet, so generate a UUID for the batch request ID.
-				// newBatchRequestID adds the "batch_req_" prefix for format consistency.
+				// No plan entry exists yet, so derive the request ID from the
+				// batch and custom IDs. The ID is stable, so re-preprocessing
+				// the same input yields the same error object.
+				requestID := stableBatchRequestID(jobID, requestMeta.CustomID)
 				errLine := &outputLine{
-					ID:       newBatchRequestID(uuid.NewString()),
+					ID:       requestID,
 					CustomID: requestMeta.CustomID,
 					Error: &outputError{
 						Code:    inference.ErrCodeModelNotFound,
@@ -199,13 +204,15 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 				}
 				lineBytes, marshalErr := json.Marshal(errLine)
 				if marshalErr != nil {
-					return fmt.Errorf("failed to marshal model_not_found error: %w", marshalErr)
+					return nil, fmt.Errorf("failed to marshal model_not_found error: %w", marshalErr)
 				}
 				lineBytes = append(lineBytes, '\n')
 				if _, writeErr := errorWriter.Write(lineBytes); writeErr != nil {
-					return fmt.Errorf("failed to write model_not_found error: %w", writeErr)
+					return nil, fmt.Errorf("failed to write model_not_found error: %w", writeErr)
 				}
 				rejectedCount++
+				manifest.add(rejectedEntry(jobID, lineCount-1, requestMeta.CustomID, requestID,
+					inference.ErrCodeModelNotFound, lineBytes))
 				// Error metric rides the route key so labels stay consistent
 				// with the dispatch path, whose items carry the scoped ID.
 				metrics.RecordRequestError(lookupID)
@@ -216,6 +223,12 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 			}
 		}
 
+		manifest.add(manifestEntry{
+			Ordinal:   lineCount - 1,
+			CustomID:  requestMeta.CustomID,
+			RequestID: stableBatchRequestID(jobID, requestMeta.CustomID),
+		})
+
 		nextOffset := accumulatePlanEntry(
 			acc, requestMeta.ModelID, modelToSafe, used, offset, uint32(len(line)), requestMeta.PrefixHash,
 		)
@@ -224,16 +237,16 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 
 	// flush input.jsonl file
 	if err := writer.Flush(); err != nil {
-		return fmt.Errorf("flush input file %q: %w", localInputFilePath, err)
+		return nil, fmt.Errorf("flush input file %q: %w", localInputFilePath, err)
 	}
 
 	if err := finalizePlanFiles(acc, modelToSafe); err != nil {
-		return fmt.Errorf("finalize plan files: %w", err)
+		return nil, fmt.Errorf("finalize plan files: %w", err)
 	}
 
 	// model map file writing
 	if err := writeModelMappings(jobRootDir, modelToSafe, lineCount, rejectedCount); err != nil {
-		return fmt.Errorf("write model map: %w", err)
+		return nil, fmt.Errorf("write model map: %w", err)
 	}
 
 	sizeBucket := metrics.GetSizeBucket(int(lineCount))
@@ -254,7 +267,7 @@ func (p *Processor) preProcessJob(ctx context.Context, jobInfo *batch_types.JobI
 		"inputFilePath", localInputFilePath, "planFilePath", acc.plansDir(),
 		"lineCount", lineCount, "rejected", rejectedCount, "models", modelCounts)
 
-	return nil
+	return manifest, nil
 }
 
 // readNormalizedLine reads the next line from the reader, ensuring it ends with '\n'.

@@ -104,7 +104,7 @@ func TestPreProcess_BuildsPlansAndModelMap_OffsetsCorrect(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 		t.Fatalf("preProcessJob: %v", err)
 	}
 
@@ -254,7 +254,7 @@ func TestPreProcess_SystemPrompts_PrefixHashAndSortOrder(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 		t.Fatalf("preProcessJob: %v", err)
 	}
 
@@ -478,7 +478,7 @@ func TestPreProcess_CancelFlag_ReturnsErrCancelled(t *testing.T) {
 
 	cancelCtx, cancel := context.WithCancelCause(ctx)
 	cancel(batchctx.ErrCancelled)
-	err = p.preProcessJob(cancelCtx, jobInfo)
+	_, err = p.preProcessJob(cancelCtx, jobInfo)
 	if !errors.Is(err, batchctx.ErrCancelled) {
 		t.Fatalf("expected batchctx.ErrCancelled, got: %v", err)
 	}
@@ -502,7 +502,7 @@ func TestPreProcess_GenuineErrorNotMaskedByCancel(t *testing.T) {
 		BatchJob: &openai.Batch{BatchSpec: openai.BatchSpec{InputFileID: ""}},
 	}
 
-	err := p.preProcessJob(ctx, jobInfo)
+	_, err := p.preProcessJob(ctx, jobInfo)
 	if err == nil {
 		t.Fatal("expected an error for empty input file ID")
 	}
@@ -586,7 +586,7 @@ func TestPreProcess_CancelBeforeSIGTERM_ReturnsErrCancelled(t *testing.T) {
 	cancelUser(batchctx.ErrCancelled)  // user cancel first
 	tripShutdown(batchctx.ErrShutdown) // SIGTERM second — no-op on the already-cancelled inner layer
 
-	err = p.preProcessJob(cancelCtx, jobInfo)
+	_, err = p.preProcessJob(cancelCtx, jobInfo)
 	if !errors.Is(err, batchctx.ErrCancelled) {
 		t.Fatalf("expected batchctx.ErrCancelled when user cancel is recorded before SIGTERM, got: %v", err)
 	}
@@ -657,7 +657,7 @@ func TestPreProcess_SLOExpiredDuringIngestion_ReturnsErrExpired(t *testing.T) {
 	sloCtx, sloCancel := context.WithDeadline(ctx, time.Now().Add(-1*time.Second))
 	defer sloCancel()
 
-	err = p.preProcessJob(sloCtx, jobInfo)
+	_, err = p.preProcessJob(sloCtx, jobInfo)
 	if !errors.Is(err, batchctx.ErrExpired) {
 		t.Fatalf("expected batchctx.ErrExpired, got: %v", err)
 	}
@@ -1432,7 +1432,7 @@ func TestPreProcess_StreamTrue_FailsJob(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	err = p.preProcessJob(ctx, jobInfo)
+	_, err = p.preProcessJob(ctx, jobInfo)
 	if err == nil {
 		t.Fatal("expected preProcessJob to fail for input with stream: true")
 	}
@@ -1500,7 +1500,7 @@ func TestPreProcess_DuplicateCustomID_FailsJob(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	err = p.preProcessJob(ctx, jobInfo)
+	_, err = p.preProcessJob(ctx, jobInfo)
 	if err == nil {
 		t.Fatal("expected preProcessJob to fail for duplicate custom_id")
 	}
@@ -1571,7 +1571,7 @@ func TestPreProcess_UniqueCustomIDs_Succeeds(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 		t.Fatalf("expected preProcessJob to succeed with unique custom_ids, got: %v", err)
 	}
 }
@@ -1650,7 +1650,7 @@ func TestPreProcess_UnregisteredModel_RejectedToErrorFile(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 		t.Fatalf("preProcessJob: %v", err)
 	}
 
@@ -1770,7 +1770,7 @@ func TestPreProcess_AllRequestsUnregistered_ExecuteJobCounts(t *testing.T) {
 		TenantID: tenantID,
 	}
 
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 		t.Fatalf("preProcessJob: %v", err)
 	}
 
@@ -1905,7 +1905,7 @@ func TestPreProcess_ReEnqueue_TruncatesStaleErrorFile(t *testing.T) {
 		t.Fatalf("WriteFile stale error: %v", err)
 	}
 
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 		t.Fatalf("preProcessJob: %v", err)
 	}
 
@@ -1990,7 +1990,7 @@ func TestPreProcess_ModelNotFound_ThenEarlySLO_PreservesErrorFile(t *testing.T) 
 	}
 
 	// Run ingestion — should reject model-b and write to error.jsonl.
-	if err := p.preProcessJob(ctx, jobInfo); err != nil {
+	if _, err := p.preProcessJob(ctx, jobInfo); err != nil {
 		t.Fatalf("preProcessJob: %v", err)
 	}
 

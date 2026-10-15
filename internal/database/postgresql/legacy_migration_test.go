@@ -36,6 +36,11 @@ func TestLegacyRowsAfterMigration(t *testing.T) {
 	}
 	defer pool.Close()
 
+	// batch_entries must go first: its foreign key blocks dropping batch_items,
+	// and ensureSchema recreates it with the constraint once the client runs.
+	if _, err := pool.Exec(ctx, "DROP TABLE IF EXISTS batch_entries"); err != nil {
+		t.Fatalf("drop entries: %v", err)
+	}
 	if _, err := pool.Exec(ctx, "DROP TABLE IF EXISTS batch_items"); err != nil {
 		t.Fatalf("drop: %v", err)
 	}
