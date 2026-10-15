@@ -902,3 +902,53 @@ func TestResumableEntryQueriesPG(t *testing.T) {
 		}
 	})
 }
+
+// TestSchemaBackfillSkipsRequeuedRows verifies that the migration backfill —
+// which hands ownerless in-flight rows to the 'pre-migration' sentinel and
+// runs on every client initialization — leaves requeued resumable rows alone:
+// such a row legitimately has no owner while it waits for the next dequeue,
+// and stamping it would make it unclaimable until the reconciler's next
+// cycle.
+func TestSchemaBackfillSkipsRequeuedRows(t *testing.T) {
+	env := newResumablePgEnv(t)
+
+	// A requeued resumable row: activated, then handed back — ownership
+	// cleared, non-terminal, waiting for the next dequeue.
+	const id = "batch-backfill-requeued"
+	epoch := env.activate(t, id)
+	if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, false, true); err != nil {
+		t.Fatalf("RequeueResumableOrphan: %v", err)
+	}
+
+	// Any pod (re)starting runs the embedded schema, backfill included.
+	batchDB, err := NewPostgresBatchDBClient(env.ctx, &PostgreSQLConfig{Url: env.url})
+	if err != nil {
+		t.Fatalf("NewPostgresBatchDBClient (schema re-run): %v", err)
+	}
+	t.Cleanup(func() { _ = batchDB.Close() })
+
+	// The waiting row was not stamped and remains claimable by the queue.
+	var processor *string
+	if err := env.pool.QueryRow(env.ctx,
+		`SELECT processor_id FROM batch_items WHERE id = $1`, id,
+	).Scan(&processor); err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	if processor != nil {
+		t.Fatalf("requeued row was stamped %q by the migration backfill: it becomes unclaimable until the reconciler cycle", *processor)
+	}
+
+	tasks, err := env.queue.PQDequeue(env.ctx, time.Minute, 10)
+	if err != nil {
+		t.Fatalf("PQDequeue: %v", err)
+	}
+	found := false
+	for _, task := range tasks {
+		if task.ID == id {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("requeued row %s was not claimable after a schema re-run: %+v", id, tasks)
+	}
+}

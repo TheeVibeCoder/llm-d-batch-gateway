@@ -35,12 +35,17 @@ ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS resumable BOOLEAN NOT NULL DEFA
 -- Rows written before the queue columns existed carry the SLO in a tag and
 -- have no owner. Restore the queue order from the tag and hand in-flight rows
 -- to a sentinel owner so the reconciler reclaims them on its first cycle.
+-- Resumable rows are excluded: a requeued row legitimately has no owner
+-- (processor_id IS NULL, non-terminal) while it waits for the next dequeue,
+-- and stamping it would make it unclaimable until the reconciler's next
+-- cycle. Legacy rows predate the resumable flag and are always FALSE.
 UPDATE batch_items
    SET priority = (tags->>'slo_unix_micro')::bigint
  WHERE priority IS NULL AND tags ? 'slo_unix_micro';
 UPDATE batch_items
    SET processor_id = 'pre-migration'
  WHERE processor_id IS NULL
+   AND resumable = FALSE
    AND status::jsonb->>'status' IN ('in_progress', 'finalizing', 'cancelling');
 
 CREATE INDEX IF NOT EXISTS idx_batch_items_tenant_id ON batch_items(tenant_id);
