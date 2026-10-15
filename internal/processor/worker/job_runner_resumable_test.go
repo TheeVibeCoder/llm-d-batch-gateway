@@ -910,7 +910,11 @@ func TestRunJob_Resumable_ResumeSkipsCheckpointedEntries(t *testing.T) {
 
 // TestRunJob_Resumable_IntegrityMismatchFailsTheJob verifies that a persisted
 // entry set that no longer matches the manifest re-derived from the input file
-// fails the job instead of resuming a diverged batch.
+// fails the job instead of resuming a diverged batch. Because recoverResumable
+// failed with the entry set already checkpointed, the failure must route
+// through finalizeResumableAs rather than the legacy handleFailed: the terminal
+// row carries the checkpointed entry's counts and output artifact, and the
+// fenced terminal write clears the resumable flag.
 func TestRunJob_Resumable_IntegrityMismatchFailsTheJob(t *testing.T) {
 	const jobID = "job-resumable-integrity"
 
@@ -932,9 +936,38 @@ func TestRunJob_Resumable_IntegrityMismatchFailsTheJob(t *testing.T) {
 		Resumable: true,
 	})
 
-	assertJobStatus(t, env.dbClient, jobID, openai.BatchStatusFailed)
 	if got := env.asyncClient.submitCount(); got != 0 {
 		t.Fatalf("submitted requests = %d, want 0 (a diverged batch must not resume)", got)
+	}
+
+	// The recover failure finalizes through the entry set: the terminal row
+	// carries the checkpointed entry's counts and output artifact, which the
+	// legacy handleFailed would have dropped for a 0/0/0 plain failed write.
+	status := durableJobStatus(t, env)
+	if status.Status != openai.BatchStatusFailed {
+		t.Fatalf("status = %s, want %s", status.Status, openai.BatchStatusFailed)
+	}
+	wantCounts := openai.BatchRequestCounts{Total: 1, Completed: 1, Failed: 0}
+	if status.RequestCounts != wantCounts {
+		t.Fatalf("counts = %+v, want %+v (the checkpointed entry's counts)", status.RequestCounts, wantCounts)
+	}
+	outFileID := stableFileID(jobID, metrics.FileTypeOutput)
+	if status.OutputFileID == nil || *status.OutputFileID != outFileID {
+		t.Fatalf("output_file_id = %v, want the committed artifact %s", status.OutputFileID, outFileID)
+	}
+	outLines := readArtifactLines(t, env, ucom.FileStorageName(outFileID, jobOutputStorageName(jobID)))
+	if len(outLines) != 1 || outLines[0].ID != stableBatchRequestID(jobID, "req-1") {
+		t.Fatalf("output artifact = %+v, want the checkpointed req-1 line", outLines)
+	}
+
+	// The fenced terminal write cleared the resumable flag; the legacy path
+	// would have left it set on the terminal row.
+	items, _, _, err := env.dbClient.DBGet(context.Background(), &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DBGet %s: err=%v len=%d", jobID, err, len(items))
+	}
+	if items[0].Resumable {
+		t.Fatal("terminal row is still flagged resumable")
 	}
 }
 
@@ -1109,6 +1142,86 @@ func TestFinalizeResumableJob_IntegrityFailureAbortsArtifacts(t *testing.T) {
 	outKey := ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeOutput), jobOutputStorageName(jobID))
 	if _, _, err := env.filesClient.Retrieve(context.Background(), outKey, folder); err == nil {
 		t.Fatal("aborted output artifact is visible in storage")
+	}
+}
+
+// failingCommitFilesClient wraps the mock files store and fails Commit for
+// one artifact key — the crash window between the output artifact's commit
+// and the error artifact's.
+type failingCommitFilesClient struct {
+	*mockfiles.MockBatchFilesClient
+	failKey string
+}
+
+func (c *failingCommitFilesClient) OpenStream(ctx context.Context, fileName, folderName string) (filesapi.StreamWriter, error) {
+	w, err := c.MockBatchFilesClient.OpenStream(ctx, fileName, folderName)
+	if err != nil || fileName != c.failKey {
+		return w, err
+	}
+	return &failingCommitWriter{StreamWriter: w}, nil
+}
+
+// failingCommitWriter accepts writes but never commits.
+type failingCommitWriter struct {
+	filesapi.StreamWriter
+}
+
+func (w *failingCommitWriter) Commit(ctx context.Context) (*filesapi.BatchFileMetadata, error) {
+	return nil, errors.New("injected error-artifact commit failure")
+}
+
+// TestFinalizeResumableJob_ErrorArtifactCommitFailureKeepsOutput covers the
+// window between the output artifact's commit and the error artifact's:
+// assembly surfaces the partial results, so the failed-status fallback
+// references the already-stored output file instead of dropping it.
+func TestFinalizeResumableJob_ErrorArtifactCommitFailureKeepsOutput(t *testing.T) {
+	const jobID = "job-resumable-partial-artifacts"
+
+	env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
+	env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress})
+	env.jobItem.Epoch = 2
+	if err := env.dbClient.DBStore(testLoggerCtx(t), env.jobItem); err != nil {
+		t.Fatalf("DBStore job item: %v", err)
+	}
+	// One completed entry (output artifact) and one failed entry with an
+	// error object (error artifact), so both writers open during assembly.
+	env.stageResumedClaim(t, 2,
+		checkpointedLineEntry(t, env, jobID, "req-1", 0),
+		rejectedLineEntry(t, env, jobID, "req-2", 1),
+	)
+
+	// Fail only the error artifact's commit; the output artifact commits.
+	errKey := ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeError), jobErrorStorageName(jobID))
+	env.p.files.storage = &failingCommitFilesClient{
+		MockBatchFilesClient: env.p.files.storage.(*mockfiles.MockBatchFilesClient),
+		failKey:              errKey,
+	}
+
+	err := env.p.finalizeResumableJob(testLoggerCtx(t), NewStatusUpdater(env.dbClient), env.jobItem, env.jobInfo)
+	if !errors.Is(err, errFinalizeFailedOver) {
+		t.Fatalf("finalizeResumableJob error = %v, want errFinalizeFailedOver", err)
+	}
+
+	// The fallback wrote failed with the partial results: the committed
+	// output artifact is referenced by the terminal row, not dropped.
+	status := durableJobStatus(t, env)
+	if status.Status != openai.BatchStatusFailed {
+		t.Fatalf("status = %s, want %s", status.Status, openai.BatchStatusFailed)
+	}
+	wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 1, Failed: 1}
+	if status.RequestCounts != wantCounts {
+		t.Fatalf("counts = %+v, want %+v", status.RequestCounts, wantCounts)
+	}
+	outFileID := stableFileID(jobID, metrics.FileTypeOutput)
+	if status.OutputFileID == nil || *status.OutputFileID != outFileID {
+		t.Fatalf("output_file_id = %v, want the committed artifact %s", status.OutputFileID, outFileID)
+	}
+	if status.ErrorFileID != nil {
+		t.Fatalf("error_file_id = %v, want nil (the error artifact never committed)", status.ErrorFileID)
+	}
+	outLines := readArtifactLines(t, env, ucom.FileStorageName(outFileID, jobOutputStorageName(jobID)))
+	if len(outLines) != 1 || outLines[0].ID != stableBatchRequestID(jobID, "req-1") {
+		t.Fatalf("output artifact = %+v, want the checkpointed req-1 line", outLines)
 	}
 }
 
