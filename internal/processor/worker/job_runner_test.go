@@ -286,7 +286,7 @@ func TestHandlePanicRecovery_BeforeInProgress_MarksFailed(t *testing.T) {
 		updater: NewStatusUpdater(dbClient),
 		jobItem: jobItem,
 		jobInfo: &batch_types.JobInfo{JobID: "job-panic-pre"},
-	}, false, nil)
+	}, nil)
 
 	assertJobStatus(t, dbClient, "job-panic-pre", openai.BatchStatusFailed)
 }
@@ -309,7 +309,7 @@ func TestHandlePanicRecovery_AfterInProgress_WithCounts_MarksFailed(t *testing.T
 		updater: NewStatusUpdater(dbClient),
 		jobItem: jobItem,
 		jobInfo: &batch_types.JobInfo{JobID: "job-panic-partial"},
-	}, true, counts)
+	}, counts)
 
 	assertJobStatus(t, dbClient, "job-panic-partial", openai.BatchStatusFailed)
 }
@@ -331,7 +331,7 @@ func TestHandlePanicRecovery_AfterInProgress_NilCounts_MarksFailed(t *testing.T)
 		updater: NewStatusUpdater(dbClient),
 		jobItem: jobItem,
 		jobInfo: &batch_types.JobInfo{JobID: "job-panic-nocounts"},
-	}, true, nil)
+	}, nil)
 
 	assertJobStatus(t, dbClient, "job-panic-nocounts", openai.BatchStatusFailed)
 }
@@ -355,7 +355,7 @@ func TestHandlePanicRecovery_CancelledContext_StillMarksFailed(t *testing.T) {
 		updater: NewStatusUpdater(dbClient),
 		jobItem: jobItem,
 		jobInfo: &batch_types.JobInfo{JobID: "job-panic-cancelled-ctx"},
-	}, true, nil)
+	}, nil)
 
 	assertJobStatus(t, dbClient, "job-panic-cancelled-ctx", openai.BatchStatusFailed)
 }
@@ -378,7 +378,7 @@ func TestHandlePanicRecovery_DBError_DoesNotCrash(t *testing.T) {
 		updater: NewStatusUpdater(dbClient),
 		jobItem: jobItem,
 		jobInfo: &batch_types.JobInfo{JobID: "job-panic-db-err"},
-	}, true, counts)
+	}, counts)
 
 	assertJobStatus(t, dbClient, "job-panic-db-err", openai.BatchStatusInProgress)
 }
@@ -386,8 +386,8 @@ func TestHandlePanicRecovery_DBError_DoesNotCrash(t *testing.T) {
 func TestHandlePanicRecovery_NilParams_DoesNotPanic(t *testing.T) {
 	ctx := testLoggerCtx(t)
 	p := mustNewProcessor(t, config.NewConfig(), &clientset.Clientset{})
-	p.handlePanicRecovery(ctx, nil, false, nil)
-	p.handlePanicRecovery(ctx, &jobExecutionParams{}, false, nil)
+	p.handlePanicRecovery(ctx, nil, nil)
+	p.handlePanicRecovery(ctx, &jobExecutionParams{}, nil)
 }
 
 // dbBlockingUpdateWrapper blocks DBUpdate until its context is cancelled,
@@ -448,7 +448,7 @@ func TestHandlePanicRecovery_BlockingDB_ReturnsWithinTimeout(t *testing.T) {
 			updater: NewStatusUpdater(blockingDB),
 			jobItem: jobItem,
 			jobInfo: &batch_types.JobInfo{JobID: "job-panic-block"},
-		}, false, nil)
+		}, nil)
 		close(done)
 	}()
 

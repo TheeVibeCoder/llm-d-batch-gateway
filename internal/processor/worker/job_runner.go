@@ -77,10 +77,7 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 	defer p.release()
 	// Declared before the deferred recover so the panic handler can inspect
 	// how far execution progressed and attempt partial-result preservation.
-	var (
-		transitionedToInProgress bool
-		requestCounts            *openai.BatchRequestCounts
-	)
+	var requestCounts *openai.BatchRequestCounts
 	// Note: recover() only catches panics on this goroutine. Panics in child
 	// goroutines (watchCancel, per-model/per-request goroutines in executeJob)
 	// are not caught here and will crash the process.
@@ -94,7 +91,7 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 		span.RecordError(fmt.Errorf("panic: %v", r))
 		span.SetStatus(codes.Error, "panic recovered")
 
-		p.handlePanicRecovery(ctx, params, transitionedToInProgress, requestCounts)
+		p.handlePanicRecovery(ctx, params, requestCounts)
 	}()
 
 	metrics.IncActiveWorkers()
@@ -263,7 +260,6 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 	}
 	params.resultSink = sink
 	params.resumeSeed = seed
-	transitionedToInProgress = true
 	// The activation CTE writes in_progress (and its timestamp) directly in
 	// Postgres; refresh the in-memory status so later status documents build
 	// on the row's actual state instead of the stale validating JSON.
@@ -369,13 +365,19 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 	logger.V(logging.INFO).Info("Job completed successfully")
 }
 
-// handlePanicRecovery moves a job to a terminal failed state after a panic in runJob.
-// It tries to preserve partial results when possible, falling back to a plain failure.
+// handlePanicRecovery contains the damage of a panic in runJob. A batch on
+// the durable pipeline — activated here, or resumed from a requeue and
+// already carrying its entry set — is left non-terminal: its checkpointed
+// entries survive in the entry store, the ownership lease stops renewing as
+// runJob unwinds, and the reconciler requeue hands the batch to a replacement
+// that retries under the fence. An unfenced failed write here would terminalize
+// the batch without artifact IDs and strand the checkpointed output on a row
+// that is no longer eligible for recovery. A fresh batch that has not
+// activated yet has nothing checkpointed, so it keeps the plain failed write.
 // A secondary recover guard prevents a double-panic from crashing the process.
 func (p *Processor) handlePanicRecovery(
 	ctx context.Context,
 	params *jobExecutionParams,
-	transitionedToInProgress bool,
 	requestCounts *openai.BatchRequestCounts,
 ) {
 	defer func() {
@@ -389,6 +391,16 @@ func (p *Processor) handlePanicRecovery(
 
 	if params == nil || params.updater == nil || params.jobItem == nil {
 		logger.Error(fmt.Errorf("params, updater, or jobItem is nil"), "Cannot recover job")
+		return
+	}
+
+	if params.resultSink != nil || (params.task != nil && params.task.Resumable) {
+		// Leave the row non-terminal for the reconciler requeue: the
+		// recovery budget bounds the retries, and the fenced finalization
+		// rebuilds the artifacts from the checkpoints on the next pickup.
+		logger.Info("Panic on a durable batch; leaving it non-terminal for the reconciler requeue",
+			"jobID", params.jobItem.ID, "tenantID", params.jobItem.TenantID)
+		metrics.RecordJobProcessed(metrics.ResultReEnqueued, metrics.ReasonSystemError)
 		return
 	}
 

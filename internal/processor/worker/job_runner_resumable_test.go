@@ -1892,6 +1892,95 @@ func TestHandleJobError_Resumable_MidRunFailureFinalizesThroughTheFence(t *testi
 	}
 }
 
+// panickingOpenStreamClient returns stream writers that panic on their
+// first write — a crash after the checkpoints are durably committed but
+// before the artifacts complete, on the runJob goroutine.
+type panickingOpenStreamClient struct {
+	filesapi.BatchFilesClient
+}
+
+func (c *panickingOpenStreamClient) OpenStream(ctx context.Context, fileName, folderName string) (filesapi.StreamWriter, error) {
+	w, err := c.BatchFilesClient.OpenStream(ctx, fileName, folderName)
+	if err != nil {
+		return nil, err
+	}
+	return panickingStreamWriter{StreamWriter: w}, nil
+}
+
+// panickingStreamWriter panics on Write.
+type panickingStreamWriter struct {
+	filesapi.StreamWriter
+}
+
+func (w panickingStreamWriter) Write(p []byte) (int, error) {
+	panic("injected artifact-write panic")
+}
+
+// TestRunJob_Resumable_PanicAfterCheckpointLeavesRowRetryable verifies the
+// panic path of a durable batch: a crash after results are checkpointed but
+// before the artifacts complete must NOT terminalize the row with the
+// unfenced legacy failed write (which would supply no artifact IDs and make
+// the row ineligible for recovery). The row stays non-terminal and resumable,
+// and a replacement incarnation's finalization completes it.
+func TestRunJob_Resumable_PanicAfterCheckpointLeavesRowRetryable(t *testing.T) {
+	const jobID = "job-resumable-panic-after-checkpoint"
+
+	env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
+	// Both entries are checkpointed: the panic lands during artifact
+	// assembly, after the durable work.
+	stageFinalizingClaim(t, env, jobID)
+
+	// The artifact write panics on the runJob goroutine.
+	env.p.files.storage = &panickingOpenStreamClient{
+		BatchFilesClient: env.p.files.storage.(*mockfiles.MockBatchFilesClient),
+	}
+
+	// runJob must return normally: the panic is contained.
+	env.runResumedJob(t, &db.BatchJobPriority{
+		ID:        jobID,
+		SLO:       time.Now().Add(1 * time.Hour),
+		Epoch:     2,
+		Resumable: true,
+	})
+
+	// No unfenced failed write: the row stays in the finalizing status the
+	// finalizer wrote before assembly, still resumable, so the reconciler
+	// requeue can retry the finalization.
+	assertJobStatus(t, env.dbClient, jobID, openai.BatchStatusFinalizing)
+	items, _, _, err := env.dbClient.DBGet(context.Background(), &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DBGet %s: err=%v len=%d", jobID, err, len(items))
+	}
+	if !items[0].Resumable {
+		t.Fatal("row lost the resumable flag; the requeue cannot retry the finalization")
+	}
+
+	// The aborted artifact was never committed.
+	folder, err := ucom.GetFolderNameByTenantID(env.jobInfo.TenantID)
+	if err != nil {
+		t.Fatalf("GetFolderNameByTenantID: %v", err)
+	}
+	outKey := ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeOutput), jobOutputStorageName(jobID))
+	if _, _, err := env.filesClient.Retrieve(context.Background(), outKey, folder); err == nil {
+		t.Fatal("aborted output artifact is visible in storage")
+	}
+
+	// The replacement incarnation a requeue delivers finalizes from the
+	// checkpointed entries and completes the batch.
+	env.p.files.storage = env.filesClient
+	if err := env.p.finalizeResumableJob(testLoggerCtx(t), NewStatusUpdater(env.dbClient), env.jobItem, env.jobInfo); err != nil {
+		t.Fatalf("retry finalizeResumableJob: %v", err)
+	}
+	status := durableJobStatus(t, env)
+	if status.Status != openai.BatchStatusCompleted {
+		t.Fatalf("status after retry = %s, want completed", status.Status)
+	}
+	wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 2, Failed: 0}
+	if status.RequestCounts != wantCounts {
+		t.Fatalf("counts after retry = %+v, want %+v", status.RequestCounts, wantCounts)
+	}
+}
+
 func TestRenewBatchLease(t *testing.T) {
 	const jobID = "job-lease"
 
