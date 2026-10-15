@@ -172,8 +172,14 @@ func (w *mockStreamWriter) Commit(ctx context.Context) (*filesapi.BatchFileMetad
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	file, err := os.Create(filePath)
+	// Create-only: the commit fails when another writer published the
+	// destination while this stream was open, mirroring the fs and s3
+	// adapters' conditional publication.
+	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("%w: %s", filesapi.ErrFileExists, filepath.Join(w.folderName, w.fileName))
+		}
 		return nil, fmt.Errorf("failed to create file: %w", err)
 	}
 	defer file.Close()

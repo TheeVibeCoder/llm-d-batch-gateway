@@ -35,6 +35,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/go-logr/logr"
+	"github.com/google/uuid"
 	"github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 	fsio "github.com/llm-d/llm-d-batch-gateway/internal/files_store/io"
 	"github.com/llm-d/llm-d-batch-gateway/internal/util/logging"
@@ -47,6 +48,7 @@ const (
 type s3API interface {
 	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 	DeleteObjects(ctx context.Context, params *s3.DeleteObjectsInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
 	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
@@ -253,8 +255,11 @@ func (c *Client) Store(ctx context.Context, fileName, folderName string, fileSiz
 var errStreamAborted = errors.New("stream aborted")
 
 // OpenStream opens a streaming write to S3. The upload runs under the
-// context passed here: cancelling it fails subsequent writes. The object
-// becomes visible only when the returned StreamWriter is committed.
+// context passed here: cancelling it fails subsequent writes. The bytes go
+// to a unique staging key and become visible at the destination only when
+// the returned StreamWriter is committed — the commit publishes with a
+// create-only conditional write, which the multipart upload of a large body
+// cannot carry itself.
 func (c *Client) OpenStream(ctx context.Context, fileName, folderName string) (api.StreamWriter, error) {
 	key := c.buildKey(folderName, fileName)
 
@@ -271,17 +276,21 @@ func (c *Client) OpenStream(ctx context.Context, fileName, folderName string) (a
 		return nil, err
 	}
 
+	stagingKey := key + ".staging." + uuid.NewString()
+
 	pr, pw := io.Pipe()
 	w := &s3StreamWriter{
-		pw:     pw,
-		done:   make(chan error, 1),
-		bucket: c.bucket,
-		key:    key,
+		pw:         pw,
+		s3Client:   c.s3Client,
+		done:       make(chan error, 1),
+		bucket:     c.bucket,
+		key:        key,
+		stagingKey: stagingKey,
 	}
 	go func() {
 		_, uploadErr := c.uploader.Upload(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(c.bucket),
-			Key:    aws.String(key),
+			Key:    aws.String(stagingKey),
 			Body:   pr,
 		})
 		// Unblock a writer stuck in Write now that the upload stopped
@@ -293,16 +302,21 @@ func (c *Client) OpenStream(ctx context.Context, fileName, folderName string) (a
 	return w, nil
 }
 
-// s3StreamWriter pipes writes into an S3 upload. The manager.Uploader
-// switches to multipart for large bodies and aborts its parts when the
-// body read fails, so an Abort leaves no partial object behind.
+// s3StreamWriter pipes writes into an S3 upload under a unique staging key;
+// Commit publishes the staged bytes to the destination with a create-only
+// conditional write. The manager.Uploader switches to multipart for large
+// bodies and aborts its parts when the body read fails, so an Abort leaves
+// no partial object behind — at worst an unreferenced staging object, which
+// Abort removes best-effort.
 type s3StreamWriter struct {
-	pw     *io.PipeWriter
-	done   chan error
-	mu     sync.Mutex
-	bucket string
-	key    string
-	bytes  int64
+	pw         *io.PipeWriter
+	done       chan error
+	mu         sync.Mutex
+	s3Client   s3API
+	bucket     string
+	key        string
+	stagingKey string
+	bytes      int64
 }
 
 var _ api.StreamWriter = (*s3StreamWriter)(nil)
@@ -321,13 +335,77 @@ func (w *s3StreamWriter) Commit(ctx context.Context) (*api.BatchFileMetadata, er
 		return nil, err
 	}
 
-	logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("File streamed successfully",
-		"bucket", w.bucket, "key", w.key, "size", w.bytes)
+	md, err := w.publish(ctx)
+	if err != nil {
+		return nil, err
+	}
 
+	logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("File streamed successfully",
+		"bucket", w.bucket, "key", w.key, "size", md.Size)
+
+	return md, nil
+}
+
+// publish moves the staged object to its destination with an If-None-Match
+// conditional write, making the commit create-only: a writer that opened
+// its stream before the current owner published gets ErrFileExists instead
+// of replacing the winner's object.
+func (w *s3StreamWriter) publish(ctx context.Context) (*api.BatchFileMetadata, error) {
+	staged, err := w.s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(w.bucket),
+		Key:    aws.String(w.stagingKey),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("open staged object %s: %w", w.stagingKey, err)
+	}
+	defer staged.Body.Close()
+
+	var size int64
+	if staged.ContentLength != nil {
+		size = *staged.ContentLength
+	}
+
+	_, err = w.s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(w.bucket),
+		Key:           aws.String(w.key),
+		Body:          staged.Body,
+		ContentLength: staged.ContentLength,
+		IfNoneMatch:   aws.String("*"),
+	})
+	if err != nil {
+		// This SDK version surfaces the 412 only as an error code, not a
+		// typed error.
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
+			// Another writer published first: the winner's object stands, and
+			// this stream's staged bytes are garbage.
+			if _, delErr := w.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: aws.String(w.bucket),
+				Key:    aws.String(w.stagingKey),
+			}); delErr != nil {
+				logr.FromContextOrDiscard(ctx).Error(delErr, "Failed to delete staged object", "key", w.stagingKey)
+			}
+			return nil, fmt.Errorf("%w: %s", api.ErrFileExists, w.key)
+		}
+		return nil, err
+	}
+
+	// The destination owns the bytes now; drop the staging object.
+	if _, err := w.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(w.bucket),
+		Key:    aws.String(w.stagingKey),
+	}); err != nil {
+		logr.FromContextOrDiscard(ctx).Error(err, "Failed to delete staged object", "key", w.stagingKey)
+	}
+
+	modTime := time.Now()
+	if staged.LastModified != nil {
+		modTime = *staged.LastModified
+	}
 	return &api.BatchFileMetadata{
 		Location: w.key,
-		Size:     w.bytes,
-		ModTime:  time.Now(),
+		Size:     size,
+		ModTime:  modTime,
 	}, nil
 }
 
@@ -335,7 +413,15 @@ func (w *s3StreamWriter) Abort(ctx context.Context) error {
 	// Failing the body read aborts the upload.
 	_ = w.pw.CloseWithError(errStreamAborted)
 	if err := w.result(); err == nil {
-		return fmt.Errorf("stream aborted but object %s was already uploaded", w.key)
+		// The staged object was fully uploaded but never published; remove
+		// it so the abort leaves nothing behind.
+		if _, delErr := w.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(w.bucket),
+			Key:    aws.String(w.stagingKey),
+		}); delErr != nil {
+			logr.FromContextOrDiscard(ctx).Error(delErr, "Failed to delete staged object after abort", "key", w.stagingKey)
+		}
+		return fmt.Errorf("stream aborted but staged object %s was already uploaded", w.stagingKey)
 	}
 	return nil
 }

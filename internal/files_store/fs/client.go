@@ -223,7 +223,10 @@ func (c *Client) OpenStream(ctx context.Context, fileName, folderName string) (a
 	}, nil
 }
 
-// fsStreamWriter streams into a temp file, renaming it into place on Commit.
+// fsStreamWriter streams into a temp file, linking it into place on
+// Commit. The link (unlike a rename) fails when the destination exists,
+// so the commit is create-only: a writer that opened its stream before the
+// current owner published cannot replace the winner's object.
 type fsStreamWriter struct {
 	root    *os.Root
 	file    *os.File
@@ -243,12 +246,22 @@ func (w *fsStreamWriter) Commit(ctx context.Context) (*api.BatchFileMetadata, er
 		err = w.file.Close()
 	}
 	if err == nil {
-		err = w.root.Rename(w.tmpName, w.dstPath)
+		// Link the temp file into place as the last operation, like Store:
+		// unlike rename, a hard link fails when the destination exists, so
+		// the create-only contract holds even when the open-time Stat raced
+		// another writer — a stale owner cannot replace the current owner's
+		// object.
+		err = w.root.Link(w.tmpName, w.dstPath)
+		if errors.Is(err, iofs.ErrExist) {
+			err = fmt.Errorf("%w: %s", api.ErrFileExists, w.dstPath)
+		}
 	}
 	if err != nil {
 		_ = w.root.Remove(w.tmpName)
 		return nil, err
 	}
+	// The destination owns the bytes now; the temp name is an alias.
+	_ = w.root.Remove(w.tmpName)
 
 	logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("File streamed successfully",
 		"path", w.dstPath, "size", info.Size())

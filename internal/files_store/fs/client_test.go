@@ -603,6 +603,54 @@ func TestOpenStream(t *testing.T) {
 		}
 	})
 
+	t.Run("commit is create-only: a stale writer cannot replace the winner's file", func(t *testing.T) {
+		client := newTestClient(t)
+
+		// Both writers pass the open-time existence check — the takeover
+		// shape: a stale owner that opened its stream before the current
+		// owner published.
+		winner, err := client.OpenStream(ctx, "out.jsonl", testFolder)
+		if err != nil {
+			t.Fatalf("open winner: %v", err)
+		}
+		stale, err := client.OpenStream(ctx, "out.jsonl", testFolder)
+		if err != nil {
+			t.Fatalf("open stale: %v", err)
+		}
+		if _, err := winner.Write([]byte("winner")); err != nil {
+			t.Fatalf("write winner: %v", err)
+		}
+		if _, err := stale.Write([]byte("stale")); err != nil {
+			t.Fatalf("write stale: %v", err)
+		}
+
+		if _, err := winner.Commit(ctx); err != nil {
+			t.Fatalf("winner commit: %v", err)
+		}
+		if _, err := stale.Commit(ctx); !errors.Is(err, api.ErrFileExists) {
+			t.Fatalf("stale commit: expected ErrFileExists, got %v", err)
+		}
+
+		// The winner's publication stands, byte for byte.
+		data, err := os.ReadFile(filepath.Join(client.root.Name(), testFolder, "out.jsonl"))
+		if err != nil {
+			t.Fatalf("read committed file: %v", err)
+		}
+		if string(data) != "winner" {
+			t.Errorf("committed content = %q, want the winner's %q", data, "winner")
+		}
+
+		// The failed commit cleaned up its temp file: only the publication
+		// remains.
+		entries, err := os.ReadDir(filepath.Join(client.root.Name(), testFolder))
+		if err != nil {
+			t.Fatalf("failed to read folder: %v", err)
+		}
+		if len(entries) != 1 || entries[0].Name() != "out.jsonl" {
+			t.Errorf("expected only out.jsonl after the race, got %v", entries)
+		}
+	})
+
 	t.Run("concurrent streams to the same target leave one visible file", func(t *testing.T) {
 		client := newTestClient(t)
 

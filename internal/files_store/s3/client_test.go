@@ -29,6 +29,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/llm-d/llm-d-batch-gateway/internal/files_store/api"
 )
 
@@ -119,6 +120,20 @@ func (m *mockS3Client) GetObject(_ context.Context, params *s3.GetObjectInput, _
 		ContentLength: aws.Int64(int64(len(obj.data))),
 		LastModified:  aws.Time(obj.lastModTime),
 	}, nil
+}
+
+func (m *mockS3Client) PutObject(_ context.Context, params *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	if params.IfNoneMatch != nil && *params.IfNoneMatch == "*" {
+		if _, exists := m.objects[*params.Key]; exists {
+			return nil, &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "object already exists"}
+		}
+	}
+	data, err := io.ReadAll(params.Body)
+	if err != nil {
+		return nil, err
+	}
+	m.objects[*params.Key] = mockObject{data: data, lastModTime: time.Now()}
+	return &s3.PutObjectOutput{}, nil
 }
 
 func (m *mockS3Client) HeadObject(_ context.Context, params *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
@@ -741,6 +756,53 @@ func TestOpenStream(t *testing.T) {
 		}
 		if err := w.Abort(context.Background()); err != nil {
 			t.Fatalf("abort failed: %v", err)
+		}
+	})
+
+	t.Run("commit is create-only: a stale writer cannot replace the winner's object", func(t *testing.T) {
+		ctx := context.Background()
+		mock := newMockS3Client()
+		client := newTestClient(mock)
+		key := testFolderName + "/out.jsonl"
+
+		// Both writers pass the open-time existence check — the takeover
+		// shape: a stale owner that opened its stream before the current
+		// owner published. Each streams into its own staging object.
+		winner, err := client.OpenStream(ctx, "out.jsonl", testFolderName)
+		if err != nil {
+			t.Fatalf("open winner: %v", err)
+		}
+		stale, err := client.OpenStream(ctx, "out.jsonl", testFolderName)
+		if err != nil {
+			t.Fatalf("open stale: %v", err)
+		}
+		if _, err := winner.Write([]byte("winner")); err != nil {
+			t.Fatalf("write winner: %v", err)
+		}
+		if _, err := stale.Write([]byte("stale")); err != nil {
+			t.Fatalf("write stale: %v", err)
+		}
+
+		if _, err := winner.Commit(ctx); err != nil {
+			t.Fatalf("winner commit: %v", err)
+		}
+		if _, err := stale.Commit(ctx); !errors.Is(err, api.ErrFileExists) {
+			t.Fatalf("stale commit: expected ErrFileExists, got %v", err)
+		}
+
+		// The winner's publication stands, byte for byte.
+		obj, ok := mock.objects[key]
+		if !ok {
+			t.Fatal("expected the destination object to be published")
+		}
+		if string(obj.data) != "winner" {
+			t.Errorf("published content = %q, want the winner's %q", obj.data, "winner")
+		}
+
+		// Both staging objects were cleaned up: only the publication
+		// remains.
+		if len(mock.objects) != 1 {
+			t.Errorf("expected only the destination object, got %d objects: %v", len(mock.objects), mock.objects)
 		}
 	})
 
