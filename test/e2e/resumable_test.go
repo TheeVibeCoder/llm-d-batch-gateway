@@ -234,21 +234,42 @@ func doTestResumableMultiWorker(t *testing.T) {
 	}
 }
 
+// pinSimLatency pins the simulator's per-request latency for a mid-flight
+// disruption test. The processor throttles progress flushes to the DB
+// (progressUpdateInterval, 15s by default), so a partial completed set is
+// observable only when request completions straddle a flush boundary. The
+// latency is pinned because environments vary, and the callers stagger
+// max_tokens per line because dispatch concurrency varies too: dev-deploy
+// forwards serially while CI's epp job forwards concurrently, and an
+// unstaggered workload finished all 12 requests inside one flush interval.
+func pinSimLatency(t *testing.T) {
+	t.Helper()
+	patchEngineConfig(t, testSimService, `{"time_to_first_token": 100, "inter_token_latency": 100}`)
+	t.Cleanup(func() {
+		if err := tryPatchEngineConfig(t, testSimService, `{"time_to_first_token": 50, "inter_token_latency": 100}`); err != nil {
+			t.Logf("restore simulator latency: %v", err)
+		}
+	})
+}
+
 // doTestResumablePodLoss deletes the Processor pod mid-batch and asserts the
 // replacement pod reclaims the batch and completes it from its checkpoints,
-// with every request accounted for exactly once. The slow workload (~20s per
-// request on dev-deploy sim defaults) keeps the batch mid-flight at the
-// disruption while staying small enough to drain within the completion
-// window: the dispatcher forwards one request at a time.
+// with every request accounted for exactly once. The simulator latency is
+// pinned and max_tokens staggered per line (~4s..~24s per request): a partial
+// completed set must be observable across the processor's progress flush
+// interval whether the dispatcher forwards serially (dev-deploy) or
+// concurrently (CI), while the batch still drains well within the completion
+// window.
 func doTestResumablePodLoss(t *testing.T) {
 	waitForDispatchQueueDrain(t, dispatcherReqQueue, 5*time.Minute)
+	pinSimLatency(t)
 
 	const requests = 12
 	lines := make([]string, 0, requests)
 	for i := 0; i < requests; i++ {
 		lines = append(lines, fmt.Sprintf(
-			`{"custom_id":"resumable-pod-loss-%d","method":"POST","url":"/v1/chat/completions","body":{"model":"%s","max_tokens":200,"messages":[{"role":"user","content":"slow %d"}]}}`,
-			i, testSimModel, i))
+			`{"custom_id":"resumable-pod-loss-%d","method":"POST","url":"/v1/chat/completions","body":{"model":"%s","max_tokens":%d,"messages":[{"role":"user","content":"slow %d"}]}}`,
+			i, testSimModel, 40+20*i, i))
 	}
 	fileID := mustCreateFile(t, fmt.Sprintf("resumable-pod-loss-%s.jsonl", testRunID), strings.Join(lines, "\n"))
 	batchID := mustCreateBatch(t, fileID)
@@ -288,12 +309,14 @@ func doTestResumablePodLoss(t *testing.T) {
 // doTestResumableMultiReplica scales the Processor to two replicas, deletes
 // one pod mid-batch, and asserts the batch still completes exactly once.
 // Takeover by the surviving replica may wait for the ownership lease to
-// expire, so the completion timeout is generous. Sized like PodLoss: slow
-// enough to be mid-flight at the deletion, small enough to drain after it.
+// expire, so the completion timeout is generous. Workload sized like PodLoss
+// (pinned latency, staggered max_tokens) so a partial completed set is
+// observable before the deletion.
 func doTestResumableMultiReplica(t *testing.T) {
 	// Generous: PodLoss's requeued duplicates must all be forwarded through
 	// the serial pipeline before this test starts.
 	waitForDispatchQueueDrain(t, dispatcherReqQueue, 8*time.Minute)
+	pinSimLatency(t)
 
 	workload := processorWorkload(t)
 	originalReplicas := processorReplicaCount(t, workload)
@@ -312,8 +335,8 @@ func doTestResumableMultiReplica(t *testing.T) {
 	lines := make([]string, 0, requests)
 	for i := 0; i < requests; i++ {
 		lines = append(lines, fmt.Sprintf(
-			`{"custom_id":"resumable-multi-replica-%d","method":"POST","url":"/v1/chat/completions","body":{"model":"%s","max_tokens":200,"messages":[{"role":"user","content":"slow %d"}]}}`,
-			i, testSimModel, i))
+			`{"custom_id":"resumable-multi-replica-%d","method":"POST","url":"/v1/chat/completions","body":{"model":"%s","max_tokens":%d,"messages":[{"role":"user","content":"slow %d"}]}}`,
+			i, testSimModel, 40+20*i, i))
 	}
 	fileID := mustCreateFile(t, fmt.Sprintf("resumable-multi-replica-%s.jsonl", testRunID), strings.Join(lines, "\n"))
 	batchID := mustCreateBatch(t, fileID)
