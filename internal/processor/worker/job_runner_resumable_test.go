@@ -351,13 +351,19 @@ func checkpointedLineEntry(t *testing.T, env *durableJobEnv, jobID, customID str
 // set. The requeue/claim bookkeeping itself is PG-tested — the mock cannot
 // express a claim over an already-activated batch.
 func (e *durableJobEnv) stageResumedClaim(t *testing.T, epoch int64, entries ...db.ResumableActivationEntry) {
+	e.stageResumedClaimWithLease(t, epoch, time.Minute, entries...)
+}
+
+// stageResumedClaimWithLease is stageResumedClaim with an explicit claim
+// lease TTL, for tests that need the lease to lapse on a controlled clock.
+func (e *durableJobEnv) stageResumedClaimWithLease(t *testing.T, epoch int64, ttl time.Duration, entries ...db.ResumableActivationEntry) {
 	t.Helper()
 	e.resumable.SeedBatch(e.jobItem.ID, e.jobItem.ProcessorID, epoch)
 	err := e.resumable.ActivateResumableBatch(testLoggerCtx(t), &db.ResumableActivation{
 		BatchID:     e.jobItem.ID,
 		ProcessorID: e.jobItem.ProcessorID,
 		Epoch:       epoch,
-		LeaseTTL:    time.Minute,
+		LeaseTTL:    ttl,
 		Entries:     entries,
 	})
 	if err != nil {
@@ -822,6 +828,85 @@ func TestRunJob_Resumable_PickupRouting(t *testing.T) {
 				t.Fatalf("submitted requests = %d, want 0 (a terminal-bound pickup dispatches nothing)", got)
 			}
 		})
+	}
+}
+
+// slowRetrieveFilesClient delays every retrieval, stretching artifact
+// assembly past a staged claim's lease TTL.
+type slowRetrieveFilesClient struct {
+	filesapi.BatchFilesClient
+	delay time.Duration
+}
+
+func (c *slowRetrieveFilesClient) Retrieve(ctx context.Context, fileName, folderName string) (io.ReadCloser, *filesapi.BatchFileMetadata, error) {
+	time.Sleep(c.delay)
+	return c.BatchFilesClient.Retrieve(ctx, fileName, folderName)
+}
+
+// TestRunJob_Resumable_PickupRenewsLeaseThroughTerminalization verifies the
+// pickup-phase lease renewal: a terminal-bound requeued batch finalizes
+// before any execution-phase setup, and its artifact assembly can run far
+// past the lease TTL claimed at dequeue (finalizeTimeout defaults to 30m
+// against a 5m lease). Without a renewal running from the pickup, the lease
+// lapses mid-assembly, the fenced terminal write is refused, and the
+// finalization loops through requeues.
+func TestRunJob_Resumable_PickupRenewsLeaseThroughTerminalization(t *testing.T) {
+	const jobID = "job-resumable-pickup-lease"
+
+	env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
+
+	// A short renewal interval so several ticks fire during the assembly,
+	// and a staged claim lease the delayed assembly outlives unless the
+	// renewal extends it: the fenced terminal write at the end of the
+	// assembly then requires the renewed lease.
+	env.p.cfg.Resumable.LeaseDuration = 100 * time.Millisecond
+	env.p.files.storage = &slowRetrieveFilesClient{
+		BatchFilesClient: env.p.files.storage.(*mockfiles.MockBatchFilesClient),
+		delay:            600 * time.Millisecond,
+	}
+
+	env.jobItem.Spec = mustJSON(t, openai.BatchSpec{
+		InputFileID: "file-input-" + jobID,
+		Endpoint:    openai.EndpointChatCompletions,
+	})
+	env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusCancelling})
+	env.jobItem.Epoch = 2
+	if err := env.dbClient.DBStore(testLoggerCtx(t), env.jobItem); err != nil {
+		t.Fatalf("DBStore job item: %v", err)
+	}
+	env.stageResumedClaimWithLease(t, 2, 200*time.Millisecond,
+		checkpointedLineEntry(t, env, jobID, "req-1", 0),
+		pendingLineEntry(jobID, "req-2", 1),
+	)
+	// markCancelling flipped the row to cancelling before the requeue;
+	// mirror it into the resumable store's fenced status.
+	env.resumable.SetBatchStatus(jobID, string(openai.BatchStatusCancelling))
+
+	env.runResumedJob(t, &db.BatchJobPriority{
+		ID:        jobID,
+		SLO:       time.Now().Add(1 * time.Hour),
+		Epoch:     2,
+		Resumable: true,
+	})
+
+	// The renewal ran during the pickup's terminalization — before any
+	// execution-phase setup registers one.
+	if renewals := env.resumable.LeaseRenewals(jobID); renewals < 1 {
+		t.Fatalf("lease renewals during the pickup = %d, want >= 1", renewals)
+	}
+
+	// The lease was alive at the fenced terminal write: the batch
+	// terminalized as cancelled instead of being left for a requeue.
+	status := durableJobStatus(t, env)
+	if status.Status != openai.BatchStatusCancelled {
+		t.Fatalf("status = %s, want cancelled (the lease lapsed before the fenced terminal write)", status.Status)
+	}
+	wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 1, Failed: 1}
+	if status.RequestCounts != wantCounts {
+		t.Fatalf("counts = %+v, want %+v", status.RequestCounts, wantCounts)
+	}
+	if got := env.asyncClient.submitCount(); got != 0 {
+		t.Fatalf("submitted requests = %d, want 0 (a terminal-bound pickup dispatches nothing)", got)
 	}
 }
 

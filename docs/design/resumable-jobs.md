@@ -60,8 +60,11 @@ disruption: pod death or lease expiry → batch-gc reconciler requeues the row
   lease set at activation distinguishes a resumable owner from a mere queue
   claim.
 - The owner holds a **lease** (`resumable.lease_duration`, default 5m, renewed
-  at half the interval). A batch becomes reclaimable when the owner is absent
-  from the reconciler's live-pod set or the lease has expired.
+  at half the interval until `runJob` returns — starting at the pickup, before
+  the terminal-bound routing, so an artifact assembly bounded by
+  `finalizeTimeout` cannot outlive the lease). A batch becomes reclaimable
+  when the owner is absent from the reconciler's live-pod set or the lease
+  has expired.
 - Every state write is a compare-and-swap on `(status, epoch)`. A fenced-out
   **zombie** — a former owner still executing after ownership moved — can
   checkpoint result objects (they are content-addressed and idempotent) but can

@@ -102,6 +102,28 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 
 	jobStart := time.Now()
 
+	// A requeued resumable task holds its ownership lease from the dequeue,
+	// and the pickup routing below can finalize immediately: artifact
+	// assembly is bounded by finalizeTimeout, which can far exceed the lease
+	// TTL, so the renewal must already be running or a large assembly loses
+	// the lease before the fenced terminal write and the finalization loops
+	// through requeues. There is nothing abortable before the execution
+	// phase, so this pickup renewal runs detached from the abort causes and
+	// without an ownership-lost callback — the first fenced write (entry
+	// mark, checkpoint, or the terminal transition itself) catches a lost
+	// lease. Once the batch is activated below, it is swapped for the
+	// execution-phase renewal wired to the neutral abort.
+	var stopPickupRenewal chan struct{}
+	defer func() {
+		if stopPickupRenewal != nil {
+			close(stopPickupRenewal)
+		}
+	}()
+	if params.task != nil && params.task.Resumable {
+		stopPickupRenewal = make(chan struct{})
+		go p.renewBatchLease(context.WithoutCancel(ctx), params.jobItem, nil, stopPickupRenewal)
+	}
+
 	// A requeued resumable task converges here from the unified dequeue and
 	// the startup requeue. Terminal-bound states (cancelling, SLO-expired,
 	// recovery budget exhausted) finalize with partial artifacts before any
@@ -248,12 +270,25 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 	if fresh, ferr := p.poller.fetchJobItemByID(ctx, params.jobItem.ID); ferr == nil && fresh != nil {
 		params.jobItem.Status = fresh.Status
 	}
-	// Keep the ownership lease alive until runJob returns. Registered after
-	// the abortCause defer so it fires first on unwind (LIFO): the renewal
-	// goroutine stops before the neutral cause can trip it.
+	// Keep the ownership lease alive until runJob returns. A requeued task
+	// renewed from its pickup above: stop that goroutine and rewire the
+	// renewal to the neutral ownership-lost abort for the execution phase.
+	// A fresh task's lease is created by the activation, so its renewal
+	// starts here. Like the finalization it protects, the renewal runs on a
+	// context detached from the abort causes: a cancel or SIGTERM during
+	// execution must not stop it while the (equally detached) finalization
+	// is still assembling artifacts, or the lease lapses and the fenced
+	// terminal write is refused — the row is then requeued and the
+	// finalization retried by another owner. The goroutine stops when
+	// runJob returns (the deferred close fires before the deferred neutral
+	// abort cause, LIFO).
+	if stopPickupRenewal != nil {
+		close(stopPickupRenewal)
+		stopPickupRenewal = nil
+	}
 	stopLeaseRenewal := make(chan struct{})
 	defer close(stopLeaseRenewal)
-	go p.renewBatchLease(abortCtx, params.jobItem, params.onOwnershipLost, stopLeaseRenewal)
+	go p.renewBatchLease(context.WithoutCancel(ctx), params.jobItem, params.onOwnershipLost, stopLeaseRenewal)
 
 	// execution: execute inference requests
 	execCtx, execSpan := uotel.StartSpan(abortCtx, "execute-job")

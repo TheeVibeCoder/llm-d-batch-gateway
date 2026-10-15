@@ -42,6 +42,7 @@ type mockResumableBatch struct {
 	resumable        bool
 	terminal         bool
 	leaseExpiresAt   time.Time
+	leaseRenewals    int
 	entries          []*api.ResumableEntry // ordered by ordinal
 	statusName       string                // current status name, for expected-status fences
 	statusDoc        []byte                // persisted terminal status document
@@ -101,6 +102,17 @@ func (m *MockResumableStore) BatchOwnership(batchID string) (processorID string,
 		return "", 0, 0
 	}
 	return b.processorID, b.epoch, b.recoveryAttempts
+}
+
+// LeaseRenewals returns how many times the batch's lease was successfully
+// renewed, for assertions that a renewal goroutine is running.
+func (m *MockResumableStore) LeaseRenewals(batchID string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if b, ok := m.batches[batchID]; ok {
+		return b.leaseRenewals
+	}
+	return 0
 }
 
 // SetBatchStatus overrides a seeded batch's status name, staging transitions
@@ -177,6 +189,7 @@ func (m *MockResumableStore) RenewResumableBatchLease(ctx context.Context, batch
 			batchID, processorID, epoch, api.ErrConflict)
 	}
 	b.leaseExpiresAt = m.now().Add(ttl)
+	b.leaseRenewals++
 	return nil
 }
 
