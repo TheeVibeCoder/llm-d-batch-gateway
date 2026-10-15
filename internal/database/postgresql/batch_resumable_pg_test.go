@@ -23,9 +23,11 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/llm-d/llm-d-batch-gateway/internal/database/api"
@@ -562,7 +564,76 @@ func TestFinalizeResumableBatchPG(t *testing.T) {
 			t.Fatalf("diverging retry: expected ErrConflict, got %v", err)
 		}
 	})
+
+	t.Run("verification query failure is transient, not a conflict", func(t *testing.T) {
+		const id = "batch-fin-verify-error"
+		epoch := env.activate(t, id)
+		// Stage a fence failure the verification must distinguish from an
+		// idempotent retry: the row is owned but holds a different status.
+		setBatchStatus(t, id, "finalizing")
+
+		fin := &api.ResumableFinalization{
+			BatchID: id, ProcessorID: testProcessorID, Epoch: epoch,
+			ExpectedStatus: "in_progress", Status: doc,
+		}
+
+		// Without the injected fault this is a plain conflict.
+		if err := env.store.FinalizeResumableBatch(env.ctx, fin); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("fence failure: expected ErrConflict, got %v", err)
+		}
+
+		// A transient failure of the verification query must surface as that
+		// error, not as ownership loss: this processor may still own the batch,
+		// so the caller must retry rather than abandon the finalization.
+		injected := errors.New("injected verification query failure")
+		store := &PostgresResumableStore{pgCore: &pgCore{pool: &failingQueryRowPool{
+			pgxPool: env.pool,
+			failSQL: "SELECT status FROM batch_items WHERE id = $1",
+			err:     injected,
+		}}}
+		err := store.FinalizeResumableBatch(env.ctx, fin)
+		if !errors.Is(err, injected) {
+			t.Fatalf("verification failure: expected the injected error, got %v", err)
+		}
+		if errors.Is(err, api.ErrConflict) {
+			t.Fatal("verification failure must not be classified as a conflict")
+		}
+
+		// The row was not touched by either attempt.
+		var status string
+		if err := env.pool.QueryRow(env.ctx,
+			`SELECT status->>'status' FROM batch_items WHERE id = $1`, id,
+		).Scan(&status); err != nil {
+			t.Fatalf("read row: %v", err)
+		}
+		if status != "finalizing" {
+			t.Fatalf("row status = %s, want finalizing (untouched)", status)
+		}
+	})
 }
+
+// failingQueryRowPool wraps a pgxPool and fails every QueryRow whose SQL
+// contains failSQL with err — used to inject a transient verification-query
+// failure deterministically.
+type failingQueryRowPool struct {
+	pgxPool
+	failSQL string
+	err     error
+}
+
+func (p *failingQueryRowPool) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, p.failSQL) {
+		return failedRow{err: p.err}
+	}
+	return p.pgxPool.QueryRow(ctx, sql, args...)
+}
+
+// failedRow is a pgx.Row that always fails to scan.
+type failedRow struct {
+	err error
+}
+
+func (r failedRow) Scan(dest ...any) error { return r.err }
 
 func TestResumableEntryWritesPG(t *testing.T) {
 	env := newResumablePgEnv(t)

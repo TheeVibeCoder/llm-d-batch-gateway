@@ -211,7 +211,9 @@ func (c *PostgresResumableStore) RequeueResumableOrphan(ctx context.Context, bat
 // resumable/lease (processor_id stays for audit). RowsAffected == 0 means the
 // fence failed or an earlier attempt already committed — a row persisting
 // exactly the given status document is an idempotent success, anything else a
-// conflict.
+// conflict. A failed verification query is neither: ownership is undetermined
+// and the transient error is returned so the caller retries instead of
+// abandoning a finalization it may still own.
 func (c *PostgresResumableStore) FinalizeResumableBatch(ctx context.Context, fin *api.ResumableFinalization) error {
 	if fin == nil {
 		return fmt.Errorf("FinalizeResumableBatch: nil finalization")
@@ -245,9 +247,20 @@ func (c *PostgresResumableStore) FinalizeResumableBatch(ctx context.Context, fin
 	// jsonb canonicalizes the stored document, so the comparison is
 	// semantic rather than bytewise.
 	var committed []byte
-	if err := c.pool.QueryRow(ctx,
+	switch err := c.pool.QueryRow(ctx,
 		`SELECT status FROM batch_items WHERE id = $1`, fin.BatchID,
-	).Scan(&committed); err == nil && jsonEqual(committed, fin.Status) {
+	).Scan(&committed); {
+	case errors.Is(err, pgx.ErrNoRows):
+		// The row is gone: nothing proves an earlier commit of this
+		// document, so the fence failed.
+	case err != nil:
+		// The verification itself failed. Ownership is undetermined — the
+	// fenced UPDATE matched no rows, but this processor may still own the
+	// batch — so surface the transient error instead of a conflict: the
+	// caller retries the finalization rather than abandoning one it may
+	// still hold.
+		return fmt.Errorf("FinalizeResumableBatch: verify committed status of %s: %w", fin.BatchID, err)
+	case jsonEqual(committed, fin.Status):
 		logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("FinalizeResumableBatch: already finalized",
 			"batchId", fin.BatchID, "epoch", fin.Epoch)
 		return nil
