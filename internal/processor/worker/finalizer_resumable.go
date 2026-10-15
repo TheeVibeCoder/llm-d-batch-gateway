@@ -53,7 +53,12 @@ const resumableEntriesPageSize = 500
 // writes are fenced — the finalizing write on the persisted resumable flag,
 // the terminal write on ownership — so only the incarnation that still owns
 // the activated batch may terminalize it, and a crashed incarnation's
-// committed artifacts make re-finalization idempotent.
+// committed artifacts make re-finalization idempotent. Artifact assembly
+// and the fenced terminal write are retryable work: any failure returns the
+// error without a fallback terminal write, leaving the row non-terminal so
+// the reconciler requeue retries the finalization under a current lease —
+// an unfenced failed write would discard the checkpointed work and let an
+// owner that lost its lease terminalize the batch anyway.
 func (p *Processor) finalizeResumableJob(
 	ctx context.Context,
 	updater *StatusUpdater,
@@ -81,11 +86,11 @@ func (p *Processor) finalizeResumableJob(
 
 	counts, outputFileID, errorFileID, err := p.assembleResumableArtifacts(ioCtx, dbJob, jobInfo, "")
 	if err != nil {
-		logger.Error(err, "Failed to assemble resumable artifacts")
-		if failErr := updater.UpdateFailedStatus(ioCtx, dbJob, counts, outputFileID, errorFileID); failErr != nil {
-			return fmt.Errorf("artifact assembly failed (%w) and fallback status write also failed: %w", err, failErr)
-		}
-		return fmt.Errorf("assemble resumable artifacts: %w", errFinalizeFailedOver)
+		// Artifact assembly is retryable work: a committed artifact is
+		// re-derived and verified on the retry, so leave the row non-terminal
+		// for the reconciler requeue instead of an unfenced failed write that
+		// discards the checkpointed work.
+		return fmt.Errorf("assemble resumable artifacts: %w", err)
 	}
 
 	// Best-effort: honour a user cancel that arrived during finalization —
@@ -93,11 +98,9 @@ func (p *Processor) finalizeResumableJob(
 	if errors.Is(context.Cause(ctx), batchctx.ErrCancelled) {
 		logger.V(logging.INFO).Info("Cancel requested during finalization; finalizing as cancelled")
 		if err := p.finalizeResumableStatus(ioCtx, updater, dbJob, openai.BatchStatusFinalizing, openai.BatchStatusCancelled, counts, outputFileID, errorFileID); err != nil {
-			logger.Error(err, "Failed to update cancelled status, falling back to failed with file IDs preserved")
-			if failErr := updater.UpdateFailedStatus(ioCtx, dbJob, counts, outputFileID, errorFileID); failErr != nil {
-				return fmt.Errorf("failed to update job status to cancelled (%w) and fallback to failed also failed: %w", err, failErr)
-			}
-			return fmt.Errorf("cancelled status write failed: %w", errFinalizeFailedOver)
+			// The row stays non-terminal: the reconciler requeue retries the
+			// finalization, and a pickup routes a cancelling row back here.
+			return fmt.Errorf("cancelled status write failed: %w", err)
 		}
 		setRequestCountAttrs(ctx, counts)
 		return batchctx.ErrCancelled
@@ -105,11 +108,11 @@ func (p *Processor) finalizeResumableJob(
 
 	// finalizing → completed
 	if err := p.finalizeResumableStatus(ioCtx, updater, dbJob, openai.BatchStatusFinalizing, openai.BatchStatusCompleted, counts, outputFileID, errorFileID); err != nil {
-		logger.Error(err, "Failed to update job status to completed, falling back to failed with file IDs preserved")
-		if failErr := updater.UpdateFailedStatus(ioCtx, dbJob, counts, outputFileID, errorFileID); failErr != nil {
-			return fmt.Errorf("failed to update job status to completed (%w) and fallback to failed also failed: %w", err, failErr)
-		}
-		return fmt.Errorf("completed status write failed: %w", errFinalizeFailedOver)
+		// The row stays non-terminal for the reconciler requeue: the fenced
+		// write is the only terminal transition, and re-finalization is
+		// idempotent (deterministic artifact keys, existing-artifact
+		// verification).
+		return fmt.Errorf("completed status write failed: %w", err)
 	}
 
 	setRequestCountAttrs(ctx, counts)
@@ -125,9 +128,10 @@ func (p *Processor) finalizeResumableJob(
 // expected is the row status the finalizer believes it is terminalizing —
 // the fenced terminal write is refused when the row disagrees, so a stale
 // belief cannot overwrite a row another writer moved. Cleanup and metrics
-// belong to the caller. A failed terminal write returns the error: the row
-// stays non-terminal and the reconciler requeues it, so the finalization is
-// retried instead of degraded.
+// belong to the caller. Any failure — artifact assembly or the fenced
+// terminal write — returns the error with the row left non-terminal: the
+// reconciler requeues it, so the finalization is retried under a current
+// lease instead of degraded by an unfenced failed write.
 func (p *Processor) finalizeResumableAs(
 	ctx context.Context,
 	updater *StatusUpdater,
@@ -150,11 +154,10 @@ func (p *Processor) finalizeResumableAs(
 
 	counts, outputFileID, errorFileID, err := p.assembleResumableArtifacts(ioCtx, dbJob, jobInfo, notExecutedCode)
 	if err != nil {
-		logger.Error(err, "Failed to assemble resumable artifacts")
-		if failErr := updater.UpdateFailedStatus(ioCtx, dbJob, counts, outputFileID, errorFileID); failErr != nil {
-			return fmt.Errorf("artifact assembly failed (%w) and fallback status write also failed: %w", err, failErr)
-		}
-		return fmt.Errorf("assemble resumable artifacts: %w", errFinalizeFailedOver)
+		// Artifact assembly is retryable work: leave the row non-terminal for
+		// the reconciler requeue instead of an unfenced failed write that
+		// discards the checkpointed work.
+		return fmt.Errorf("assemble resumable artifacts: %w", err)
 	}
 
 	if err := p.finalizeResumableStatus(ioCtx, updater, dbJob, expected, status, counts, outputFileID, errorFileID); err != nil {
@@ -171,9 +174,9 @@ func (p *Processor) finalizeResumableAs(
 // outcome: finalization as the given status with partial artifacts (via
 // notExecutedCode for non-terminal entries), local-artifact cleanup once the
 // row is terminal, and the per-status metrics. It is the shared tail of the
-// pickup routing and the durable runJob error branches. An error other than
-// errFinalizeFailedOver leaves the row non-terminal for the reconciler
-// requeue, so the finalization is retried.
+// pickup routing and the durable runJob error branches. An error leaves the
+// row non-terminal for the reconciler requeue, so the finalization is
+// retried under a current lease.
 func (p *Processor) finalizeResumableTerminal(
 	ctx context.Context,
 	params *jobExecutionParams,
@@ -185,17 +188,10 @@ func (p *Processor) finalizeResumableTerminal(
 
 	// Cleanup after the terminal write: if it failed, the local files survive
 	// for the reconciler requeue to retry the finalization.
-	if err == nil || errors.Is(err, errFinalizeFailedOver) {
+	if err == nil {
 		p.cleanupJobArtifacts(context.WithoutCancel(ctx), params.jobItem.ID, params.jobItem.TenantID)
 	}
 	if err != nil {
-		if errors.Is(err, errFinalizeFailedOver) {
-			// The fallback already wrote failed with whatever artifacts
-			// assembled before the failure.
-			recordE2ELatency(params.jobInfo, metrics.E2EStatusFailed)
-			metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-			return err
-		}
 		// Not logged here: every caller already logs the returned error.
 		return err
 	}

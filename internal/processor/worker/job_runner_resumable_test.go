@@ -1109,10 +1109,12 @@ func TestFinalizeResumableJob_RefinalizesIdempotently(t *testing.T) {
 	}
 }
 
-// TestFinalizeResumableJob_IntegrityFailureAbortsArtifacts verifies that a
-// result object that no longer matches its checkpointed digest aborts the
-// artifact write (no partial object is committed) and fails the job over.
-func TestFinalizeResumableJob_IntegrityFailureAbortsArtifacts(t *testing.T) {
+// TestFinalizeResumableJob_IntegrityFailureLeavesRowRetryable verifies that
+// a result object that no longer matches its checkpointed digest aborts the
+// artifact write (no partial object is committed) and returns the error
+// without a terminal write: the row stays non-terminal and resumable, so the
+// reconciler requeue retries the finalization once the divergence is gone.
+func TestFinalizeResumableJob_IntegrityFailureLeavesRowRetryable(t *testing.T) {
 	const jobID = "job-resumable-integrity-fin"
 
 	env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
@@ -1133,15 +1135,45 @@ func TestFinalizeResumableJob_IntegrityFailureAbortsArtifacts(t *testing.T) {
 	}
 
 	err = env.p.finalizeResumableJob(testLoggerCtx(t), NewStatusUpdater(env.dbClient), env.jobItem, env.jobInfo)
-	if !errors.Is(err, errFinalizeFailedOver) {
-		t.Fatalf("error = %v, want errFinalizeFailedOver", err)
+	if err == nil || errors.Is(err, errFinalizeFailedOver) {
+		t.Fatalf("error = %v, want the surfaced assembly failure", err)
 	}
-	assertJobStatus(t, env.dbClient, jobID, openai.BatchStatusFailed)
+
+	// No terminal write and no unfenced failed fallback: the row stays in the
+	// finalizing status the finalizer wrote before assembly, still resumable,
+	// so the reconciler requeue can retry the finalization.
+	assertJobStatus(t, env.dbClient, jobID, openai.BatchStatusFinalizing)
+	items, _, _, err := env.dbClient.DBGet(context.Background(), &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DBGet %s: err=%v len=%d", jobID, err, len(items))
+	}
+	if !items[0].Resumable {
+		t.Fatal("row lost the resumable flag; the requeue cannot retry the finalization")
+	}
 
 	// The aborted output artifact was never committed.
 	outKey := ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeOutput), jobOutputStorageName(jobID))
 	if _, _, err := env.filesClient.Retrieve(context.Background(), outKey, folder); err == nil {
 		t.Fatal("aborted output artifact is visible in storage")
+	}
+
+	// The retry a replacement incarnation runs after the requeue completes
+	// the batch: re-finalization is idempotent, so the artifacts are rebuilt
+	// (or verified) under a current lease.
+	if err := env.filesClient.Delete(testLoggerCtx(t), corruptKey, folder); err != nil {
+		t.Fatalf("delete corrupted object for retry: %v", err)
+	}
+	storeCheckpointedResult(t, env.filesClient, env.jobInfo.TenantID, jobID, "req-2")
+	if err := env.p.finalizeResumableJob(testLoggerCtx(t), NewStatusUpdater(env.dbClient), env.jobItem, env.jobInfo); err != nil {
+		t.Fatalf("retry finalizeResumableJob: %v", err)
+	}
+	status := durableJobStatus(t, env)
+	if status.Status != openai.BatchStatusCompleted {
+		t.Fatalf("status after retry = %s, want completed", status.Status)
+	}
+	wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 2, Failed: 0}
+	if status.RequestCounts != wantCounts {
+		t.Fatalf("counts after retry = %+v, want %+v", status.RequestCounts, wantCounts)
 	}
 }
 
@@ -1172,8 +1204,9 @@ func (w *failingCommitWriter) Commit(ctx context.Context) (*filesapi.BatchFileMe
 
 // TestFinalizeResumableJob_ErrorArtifactCommitFailureKeepsOutput covers the
 // window between the output artifact's commit and the error artifact's:
-// assembly surfaces the partial results, so the failed-status fallback
-// references the already-stored output file instead of dropping it.
+// the failure returns the error without a terminal write, so the row stays
+// non-terminal for the reconciler requeue while the committed output
+// artifact survives in storage — and the retry completes both artifacts.
 func TestFinalizeResumableJob_ErrorArtifactCommitFailureKeepsOutput(t *testing.T) {
 	const jobID = "job-resumable-partial-artifacts"
 
@@ -1198,37 +1231,55 @@ func TestFinalizeResumableJob_ErrorArtifactCommitFailureKeepsOutput(t *testing.T
 	}
 
 	err := env.p.finalizeResumableJob(testLoggerCtx(t), NewStatusUpdater(env.dbClient), env.jobItem, env.jobInfo)
-	if !errors.Is(err, errFinalizeFailedOver) {
-		t.Fatalf("finalizeResumableJob error = %v, want errFinalizeFailedOver", err)
+	if err == nil || errors.Is(err, errFinalizeFailedOver) {
+		t.Fatalf("finalizeResumableJob error = %v, want the surfaced assembly failure", err)
 	}
 
-	// The fallback wrote failed with the partial results: the committed
-	// output artifact is referenced by the terminal row, not dropped.
-	status := durableJobStatus(t, env)
-	if status.Status != openai.BatchStatusFailed {
-		t.Fatalf("status = %s, want %s", status.Status, openai.BatchStatusFailed)
-	}
-	wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 1, Failed: 1}
-	if status.RequestCounts != wantCounts {
-		t.Fatalf("counts = %+v, want %+v", status.RequestCounts, wantCounts)
-	}
+	// No terminal write and no unfenced failed fallback: the row stays in the
+	// finalizing status, so the reconciler requeue retries the finalization.
+	assertJobStatus(t, env.dbClient, jobID, openai.BatchStatusFinalizing)
+
+	// The committed output artifact survives in storage with its file record,
+	// instead of being orphaned by a degraded failed write.
 	outFileID := stableFileID(jobID, metrics.FileTypeOutput)
-	if status.OutputFileID == nil || *status.OutputFileID != outFileID {
-		t.Fatalf("output_file_id = %v, want the committed artifact %s", status.OutputFileID, outFileID)
-	}
-	if status.ErrorFileID != nil {
-		t.Fatalf("error_file_id = %v, want nil (the error artifact never committed)", status.ErrorFileID)
-	}
 	outLines := readArtifactLines(t, env, ucom.FileStorageName(outFileID, jobOutputStorageName(jobID)))
 	if len(outLines) != 1 || outLines[0].ID != stableBatchRequestID(jobID, "req-1") {
 		t.Fatalf("output artifact = %+v, want the checkpointed req-1 line", outLines)
+	}
+	files, _, _, err := env.fileDB.DBGet(context.Background(), &db.FileQuery{BaseQuery: db.BaseQuery{IDs: []string{outFileID}}}, true, 0, 1)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("file record %s: err=%v len=%d", outFileID, err, len(files))
+	}
+
+	// The retry a replacement incarnation runs after the requeue completes
+	// the batch: the committed output artifact is re-derived and verified
+	// (existing mode), the error artifact commits, and the fenced terminal
+	// write records both.
+	env.p.files.storage = env.filesClient
+	if err := env.p.finalizeResumableJob(testLoggerCtx(t), NewStatusUpdater(env.dbClient), env.jobItem, env.jobInfo); err != nil {
+		t.Fatalf("retry finalizeResumableJob: %v", err)
+	}
+	status := durableJobStatus(t, env)
+	if status.Status != openai.BatchStatusCompleted {
+		t.Fatalf("status after retry = %s, want completed", status.Status)
+	}
+	wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 1, Failed: 1}
+	if status.RequestCounts != wantCounts {
+		t.Fatalf("counts after retry = %+v, want %+v", status.RequestCounts, wantCounts)
+	}
+	if status.OutputFileID == nil || *status.OutputFileID != outFileID {
+		t.Fatalf("output_file_id = %v, want the committed artifact %s", status.OutputFileID, outFileID)
+	}
+	if status.ErrorFileID == nil || *status.ErrorFileID != stableFileID(jobID, metrics.FileTypeError) {
+		t.Fatalf("error_file_id = %v, want the error artifact", status.ErrorFileID)
 	}
 }
 
 // TestFinalizeResumableJob_FencedOutZombieCannotComplete verifies the lease
 // fence from the other side: a zombie incarnation whose lease expired (but
-// whose row was not requeued) cannot write completed — the fence refuses, and
-// the fallback degrades the row to failed instead.
+// whose row was not requeued) cannot write completed — the fenced write
+// refuses, and the row stays non-terminal and resumable for the
+// fence-passing owner instead of being degraded by an unfenced failed write.
 func TestFinalizeResumableJob_FencedOutZombieCannotComplete(t *testing.T) {
 	const jobID = "job-resumable-zombie"
 
@@ -1239,12 +1290,20 @@ func TestFinalizeResumableJob_FencedOutZombieCannotComplete(t *testing.T) {
 	env.resumable.Now = func() time.Time { return time.Now().Add(2 * time.Minute) }
 
 	err := env.p.finalizeResumableJob(testLoggerCtx(t), NewStatusUpdater(env.dbClient), env.jobItem, env.jobInfo)
-	if !errors.Is(err, errFinalizeFailedOver) {
-		t.Fatalf("error = %v, want errFinalizeFailedOver", err)
+	if !errors.Is(err, db.ErrConflict) {
+		t.Fatalf("error = %v, want a fenced-out conflict", err)
 	}
-	status := durableJobStatus(t, env)
-	if status.Status != openai.BatchStatusFailed {
-		t.Fatalf("status = %s, want failed (completed is reserved for the fence-passing owner)", status.Status)
+
+	// No terminal write and no unfenced failed fallback: the row stays in the
+	// finalizing status the finalizer wrote before assembly, still resumable,
+	// so the fence-passing owner (or a requeue) can complete it.
+	assertJobStatus(t, env.dbClient, jobID, openai.BatchStatusFinalizing)
+	items, _, _, err := env.dbClient.DBGet(context.Background(), &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DBGet %s: err=%v len=%d", jobID, err, len(items))
+	}
+	if !items[0].Resumable {
+		t.Fatal("row lost the resumable flag; the requeue cannot retry the finalization")
 	}
 }
 

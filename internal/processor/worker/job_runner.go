@@ -316,23 +316,13 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 		logger.Error(err, "Failed to finalize job")
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "finalize failed")
-		if errors.Is(err, errFinalizeFailedOver) {
-			// The finalizer's fallback already wrote failed status with the
-			// artifacts assembled so far; calling handleFailed would overwrite
-			// the file IDs.
-			p.cleanupJobArtifacts(context.Background(), params.jobItem.ID, params.jobItem.TenantID)
-			metrics.RecordJobProcessingDuration(time.Since(jobStart), metrics.GetSizeBucket(int(requestCounts.Total)))
-			recordE2ELatency(params.jobInfo, metrics.E2EStatusFailed)
-			metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonSystemError)
-		} else {
-			// The finalization failed before its terminal write and its
-			// fallbacks: the row is still non-terminal and re-finalization is
-			// idempotent, so leave it to the reconciler requeue instead of a
-			// degraded failed write.
-			logger.Info("Leaving job to the reconciler after a failed finalization")
-			metrics.RecordJobProcessingDuration(time.Since(jobStart), metrics.GetSizeBucket(int(requestCounts.Total)))
-			metrics.RecordJobProcessed(metrics.ResultReEnqueued, metrics.ReasonSystemError)
-		}
+		// The finalization failed before its terminal write and its
+		// fallbacks: the row is still non-terminal and re-finalization is
+		// idempotent, so leave it to the reconciler requeue instead of a
+		// degraded failed write.
+		logger.Info("Leaving job to the reconciler after a failed finalization")
+		metrics.RecordJobProcessingDuration(time.Since(jobStart), metrics.GetSizeBucket(int(requestCounts.Total)))
+		metrics.RecordJobProcessed(metrics.ResultReEnqueued, metrics.ReasonSystemError)
 		return
 	}
 
