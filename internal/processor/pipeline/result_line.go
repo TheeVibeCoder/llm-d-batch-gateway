@@ -18,9 +18,12 @@ type outputLine struct {
 }
 
 // Succeeded reports whether a result is a success line: no error object and
-// an HTTP 200 response. It matches the outputLine classification.
+// an HTTP 2xx response. It matches the outputLine classification: the
+// resumable artifact contract treats non-2xx responses as error responses,
+// so every successful status — not only 200 — counts as completed.
 func (r *ResultItem) Succeeded() bool {
-	return r.Error == nil && r.Response != nil && r.Response.StatusCode == 200
+	return r.Error == nil && r.Response != nil &&
+		r.Response.StatusCode >= 200 && r.Response.StatusCode <= 299
 }
 
 // ErrorCode classifies a non-success result for error reporting: the output

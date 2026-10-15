@@ -199,6 +199,24 @@ func TestBatchResultStore_Checkpoint(t *testing.T) {
 		}
 	})
 
+	t.Run("commits a 2xx response other than 200 as completed", func(t *testing.T) {
+		env := newResultStoreEnv(t, pendingActivationEntry("req-1", 0))
+
+		// A 201 is a successful response: it must be checkpointed with
+		// completed accounting, not inflate request_counts.failed.
+		msg := rsSuccessItem("req-1")
+		msg.Response.StatusCode = 201
+
+		if _, err := rsCheckpoint(ctx, env.sink, msg); err != nil {
+			t.Fatalf("Checkpoint: %v", err)
+		}
+
+		entry, _ := env.store.FindEntryByRequestID(ctx, rsBatchID, "req-1")
+		if entry.Status != db.ResumableEntryCompleted || entry.ErrorCode != "" {
+			t.Fatalf("entry after commit: %+v, want completed without an error code", entry)
+		}
+	})
+
 	t.Run("duplicate delivery of a terminal entry drops without a PUT", func(t *testing.T) {
 		rejected := db.ResumableActivationEntry{
 			RequestID:    "req-r",
