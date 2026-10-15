@@ -1637,6 +1637,204 @@ func TestRunJob_Resumable_MidRunExpiryFinalizesThroughTheFence(t *testing.T) {
 	}
 }
 
+// inputGateFilesClient gates the input file's retrieval so a test can land
+// an abort during preprocessing — before recoverResumable constructs the
+// result sink — and release (or abort) it deterministically.
+type inputGateFilesClient struct {
+	filesapi.BatchFilesClient
+	gateKey string
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *inputGateFilesClient) Retrieve(ctx context.Context, fileName, folderName string) (io.ReadCloser, *filesapi.BatchFileMetadata, error) {
+	if fileName != c.gateKey {
+		return c.BatchFilesClient.Retrieve(ctx, fileName, folderName)
+	}
+	c.once.Do(func() { close(c.reached) })
+	select {
+	case <-c.release:
+		return c.BatchFilesClient.Retrieve(ctx, fileName, folderName)
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+}
+
+// TestRunJob_Resumable_CancelDuringPreprocessingFinalizesThroughTheFence
+// covers the ingestion window of a resumed pickup: the row already carries
+// its checkpointed entry set, but recoverResumable has not constructed the
+// result sink yet. A user cancel landing in that window must finalize
+// through the entry set — the fenced cancelling → cancelled transition with
+// partial artifacts — not through the legacy write, which would drop the
+// artifact IDs and strand the checkpointed output.
+func TestRunJob_Resumable_CancelDuringPreprocessingFinalizesThroughTheFence(t *testing.T) {
+	const jobID = "job-resumable-cancel-ingest"
+
+	env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
+
+	env.jobItem.Spec = mustJSON(t, openai.BatchSpec{
+		InputFileID: "file-input-" + jobID,
+		Endpoint:    openai.EndpointChatCompletions,
+	})
+	env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress})
+	env.jobItem.Epoch = 2
+	if err := env.dbClient.DBStore(testLoggerCtx(t), env.jobItem); err != nil {
+		t.Fatalf("DBStore job item: %v", err)
+	}
+	env.stageResumedClaim(t, 2,
+		checkpointedLineEntry(t, env, jobID, "req-1", 0),
+		pendingLineEntry(jobID, "req-2", 1),
+	)
+
+	// Hold the run in preprocessing at the input-file download.
+	gated := &inputGateFilesClient{
+		BatchFilesClient: env.p.files.storage.(*mockfiles.MockBatchFilesClient),
+		gateKey:          ucom.FileStorageName("file-input-"+jobID, "input.jsonl"),
+		reached:          make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	env.p.files.storage = gated
+
+	done := env.runResumedJobAsync(t, &db.BatchJobPriority{
+		ID:        jobID,
+		SLO:       time.Now().Add(1 * time.Hour),
+		Epoch:     2,
+		Resumable: true,
+	})
+
+	// Preprocessing reached the input download: the sink does not exist yet.
+	select {
+	case <-gated.reached:
+	case <-time.After(30 * time.Second):
+		t.Fatal("preprocessing never reached the input download")
+	}
+
+	// The user cancels: the API flips the row to cancelling before the
+	// event is delivered; mirror the flip into both mock stores the way
+	// production's single UPDATE would.
+	items, _, _, err := env.dbClient.DBGet(context.Background(), &db.BatchQuery{BaseQuery: db.BaseQuery{IDs: []string{jobID}}}, true, 0, 1)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("DBGet %s: err=%v len=%d", jobID, err, len(items))
+	}
+	row := *items[0]
+	row.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusCancelling})
+	if err := env.dbClient.DBStore(testLoggerCtx(t), &row); err != nil {
+		t.Fatalf("DBStore cancelling row: %v", err)
+	}
+	env.resumable.SetBatchStatus(jobID, string(openai.BatchStatusCancelling))
+	if _, err := env.events.ECProducerSendEvents(testLoggerCtx(t), []db.BatchEvent{{ID: jobID, Type: db.BatchEventCancel, TTL: 60}}); err != nil {
+		t.Fatalf("send cancel event: %v", err)
+	}
+
+	// The abort cancels the gated download; the run finalizes through the
+	// entry set. The gate is never released — only the abort may unblock it.
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("runJob did not return after the cancel during preprocessing")
+	}
+
+	status := durableJobStatus(t, env)
+	if status.Status != openai.BatchStatusCancelled {
+		t.Fatalf("status = %s, want cancelled", status.Status)
+	}
+	wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 1, Failed: 1}
+	if status.RequestCounts != wantCounts {
+		t.Fatalf("counts = %+v, want %+v", status.RequestCounts, wantCounts)
+	}
+
+	// The checkpointed entry's object is the output artifact; the pending
+	// entry is a not-executed cancelled line.
+	outLines := readArtifactLines(t, env,
+		ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeOutput), jobOutputStorageName(jobID)))
+	if len(outLines) != 1 || outLines[0].ID != stableBatchRequestID(jobID, "req-1") {
+		t.Fatalf("output artifact = %+v, want the checkpointed req-1 line", outLines)
+	}
+	errLines := readArtifactLines(t, env,
+		ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeError), jobErrorStorageName(jobID)))
+	if len(errLines) != 1 || errLines[0].ID != stableBatchRequestID(jobID, "req-2") {
+		t.Fatalf("error artifact = %+v, want the not-executed req-2 line", errLines)
+	}
+	if errLines[0].Error == nil || errLines[0].Error.Code != string(batch_types.ErrCodeBatchCancelled) {
+		t.Fatalf("error line = %+v, want code %s", errLines[0].Error, batch_types.ErrCodeBatchCancelled)
+	}
+
+	if got := env.asyncClient.submitCount(); got != 0 {
+		t.Fatalf("submitted requests = %d, want 0 (nothing dispatched past preprocessing)", got)
+	}
+}
+
+// TestRunJob_Resumable_ExpiryDuringPreprocessingFinalizesThroughTheFence
+// covers the SLO deadline firing during the ingestion window of a resumed
+// pickup: like the cancel, it must finalize through the entry set with
+// partial artifacts rather than the legacy expired write.
+func TestRunJob_Resumable_ExpiryDuringPreprocessingFinalizesThroughTheFence(t *testing.T) {
+	const jobID = "job-resumable-expiry-ingest"
+
+	env := setupDurableJob(t, jobID, []string{"test-model", "test-model"})
+
+	env.jobItem.Spec = mustJSON(t, openai.BatchSpec{
+		InputFileID: "file-input-" + jobID,
+		Endpoint:    openai.EndpointChatCompletions,
+	})
+	env.jobItem.Status = mustJSON(t, openai.BatchStatusInfo{Status: openai.BatchStatusInProgress})
+	env.jobItem.Epoch = 2
+	if err := env.dbClient.DBStore(testLoggerCtx(t), env.jobItem); err != nil {
+		t.Fatalf("DBStore job item: %v", err)
+	}
+	env.stageResumedClaim(t, 2,
+		checkpointedLineEntry(t, env, jobID, "req-1", 0),
+		pendingLineEntry(jobID, "req-2", 1),
+	)
+
+	// Hold the run in preprocessing at the input-file download; the gate is
+	// never released, so only the SLO deadline can unblock it.
+	gated := &inputGateFilesClient{
+		BatchFilesClient: env.p.files.storage.(*mockfiles.MockBatchFilesClient),
+		gateKey:          ucom.FileStorageName("file-input-"+jobID, "input.jsonl"),
+		reached:          make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	env.p.files.storage = gated
+
+	// The SLO is in the future at pickup (so the run resumes) but fires
+	// while preprocessing is held at the gate.
+	env.runResumedJob(t, &db.BatchJobPriority{
+		ID:        jobID,
+		SLO:       time.Now().Add(2 * time.Second),
+		Epoch:     2,
+		Resumable: true,
+	})
+
+	status := durableJobStatus(t, env)
+	if status.Status != openai.BatchStatusExpired {
+		t.Fatalf("status = %s, want expired", status.Status)
+	}
+	wantCounts := openai.BatchRequestCounts{Total: 2, Completed: 1, Failed: 1}
+	if status.RequestCounts != wantCounts {
+		t.Fatalf("counts = %+v, want %+v", status.RequestCounts, wantCounts)
+	}
+
+	outLines := readArtifactLines(t, env,
+		ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeOutput), jobOutputStorageName(jobID)))
+	if len(outLines) != 1 || outLines[0].ID != stableBatchRequestID(jobID, "req-1") {
+		t.Fatalf("output artifact = %+v, want the checkpointed req-1 line", outLines)
+	}
+	errLines := readArtifactLines(t, env,
+		ucom.FileStorageName(stableFileID(jobID, metrics.FileTypeError), jobErrorStorageName(jobID)))
+	if len(errLines) != 1 || errLines[0].ID != stableBatchRequestID(jobID, "req-2") {
+		t.Fatalf("error artifact = %+v, want the not-executed req-2 line", errLines)
+	}
+	if errLines[0].Error == nil || errLines[0].Error.Code != string(batch_types.ErrCodeBatchExpired) {
+		t.Fatalf("error line = %+v, want code %s", errLines[0].Error, batch_types.ErrCodeBatchExpired)
+	}
+
+	if got := env.asyncClient.submitCount(); got != 0 {
+		t.Fatalf("submitted requests = %d, want 0 (nothing dispatched past preprocessing)", got)
+	}
+}
+
 // TestHandleJobError_Resumable_MidRunFailureFinalizesThroughTheFence covers
 // the system-error branch of the durable mid-run routing: a backend failure
 // after activation terminalizes through the fence with the unfinished entry

@@ -417,9 +417,15 @@ func (p *Processor) handleJobError(ctx context.Context, params *jobExecutionPara
 	// point: the API server flips a cancelling row before the cancel event
 	// is delivered, while an expiry or system error leaves the row at
 	// in_progress (activation wrote it; the in-memory dbJob is stale).
-	// resultSink is set only after activation succeeds, so ingestion-phase
-	// errors keep the legacy routing.
-	if params.resultSink != nil {
+	// A resumed pickup (task.Resumable) carries its persisted entry set from
+	// the earlier incarnation, so its ingestion-phase errors — before
+	// recoverResumable constructs the sink — finalize through the entry set
+	// too; the legacy write would drop the checkpointed artifacts' IDs and
+	// leave the terminal row unrecoverable. resultSink is set only after
+	// activation succeeds, so a fresh batch's ingestion-phase errors (no
+	// entries, nothing checkpointed) keep the legacy routing.
+	resumed := params.task != nil && params.task.Resumable
+	if params.resultSink != nil || resumed {
 		switch {
 		case errors.Is(err, batchctx.ErrCancelled):
 			if finErr := p.finalizeResumableTerminal(ctx, params, openai.BatchStatusCancelled, batch_types.ErrCodeBatchCancelled, openai.BatchStatusCancelling); finErr != nil {
