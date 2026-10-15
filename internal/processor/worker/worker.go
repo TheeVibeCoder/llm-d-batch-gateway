@@ -410,7 +410,7 @@ func (p *Processor) runPollingLoop(pollingCtx, jobBaseCtx context.Context) error
 				// The legacy re-enqueue refuses resumable rows; the fenced
 				// requeue returns the batch to the queue directly. Failure
 				// leaves the lease to lapse and the reconciler to requeue.
-				if err := p.resumable.RequeueResumableOrphan(bgCtx, task.ID, p.processorID, task.Epoch, false); err != nil {
+				if err := p.resumable.RequeueResumableOrphan(bgCtx, task.ID, p.processorID, task.Epoch, false, true); err != nil {
 					pollLogger.Error(err, "Failed to requeue resumable job during graceful shutdown")
 					metrics.RecordJobProcessed(metrics.ResultFailed, metrics.ReasonGuardShutdown)
 				} else {

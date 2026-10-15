@@ -238,7 +238,7 @@ func jsonEqual(a, b []byte) bool {
 	return reflect.DeepEqual(av, bv)
 }
 
-func (m *MockResumableStore) RequeueResumableOrphan(ctx context.Context, batchID, processorID string, epoch int64, requireExpiredLease bool) error {
+func (m *MockResumableStore) RequeueResumableOrphan(ctx context.Context, batchID, processorID string, epoch int64, requireExpiredLease, bumpAttempts bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -253,7 +253,9 @@ func (m *MockResumableStore) RequeueResumableOrphan(ctx context.Context, batchID
 	b.processorID = ""
 	b.leaseExpiresAt = time.Time{}
 	b.epoch++
-	b.recoveryAttempts++
+	if bumpAttempts {
+		b.recoveryAttempts++
+	}
 	return nil
 }
 

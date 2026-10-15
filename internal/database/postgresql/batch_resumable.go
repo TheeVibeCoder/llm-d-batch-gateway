@@ -179,17 +179,20 @@ func (c *PostgresResumableStore) RenewResumableBatchLease(ctx context.Context, b
 // RequeueResumableOrphan clears ownership of an orphaned resumable batch so it
 // becomes dequeuable again, keeping status and entries. The fenced CAS on
 // (processor_id, epoch) makes a race with a renewal or finalization a no-op.
-func (c *PostgresResumableStore) RequeueResumableOrphan(ctx context.Context, batchID, processorID string, epoch int64, requireExpiredLease bool) error {
+// bumpAttempts=false leaves the recovery budget untouched — the startup
+// recovery path uses it because PQClaimOwned already counted the restart.
+func (c *PostgresResumableStore) RequeueResumableOrphan(ctx context.Context, batchID, processorID string, epoch int64, requireExpiredLease, bumpAttempts bool) error {
 	query := `UPDATE batch_items
 		SET processor_id = NULL, owner_lease_expires_at = NULL,
-		    epoch = epoch + 1, recovery_attempts = recovery_attempts + 1
+		    epoch = epoch + 1,
+		    recovery_attempts = CASE WHEN $4 THEN recovery_attempts + 1 ELSE recovery_attempts END
 		WHERE id = $1 AND processor_id = $2 AND epoch = $3
 		  AND resumable = TRUE AND ` + nonTerminalCondition
 	if requireExpiredLease {
 		query += ` AND owner_lease_expires_at <= NOW()`
 	}
 
-	result, err := c.pool.Exec(ctx, query, batchID, processorID, epoch)
+	result, err := c.pool.Exec(ctx, query, batchID, processorID, epoch, bumpAttempts)
 	if err != nil {
 		return fmt.Errorf("RequeueResumableOrphan: %w", err)
 	}

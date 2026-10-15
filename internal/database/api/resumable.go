@@ -152,13 +152,19 @@ type ResumableBatchLeaseStore interface {
 	FinalizeResumableBatch(ctx context.Context, fin *ResumableFinalization) error
 
 	// RequeueResumableOrphan clears ownership of an orphaned resumable batch
-	// (processor_id = NULL, epoch + 1, recovery_attempts + 1) so it becomes
-	// dequeuable again, keeping status and entries. It is a fenced CAS on the
-	// snapshot the reconciler fetched: 0 rows means the snapshot is stale
-	// (e.g. a renewal raced) and is a no-op success. When requireExpiredLease
-	// is set the requeue additionally requires the lease to have lapsed — the
-	// wedged-owner trigger; a confirmed pod death requeues regardless.
-	RequeueResumableOrphan(ctx context.Context, batchID, processorID string, epoch int64, requireExpiredLease bool) error
+	// (processor_id = NULL, epoch + 1) so it becomes dequeuable again, keeping
+	// status and entries. It is a fenced CAS on the snapshot the reconciler
+	// fetched: 0 rows means the snapshot is stale (e.g. a renewal raced) and
+	// is a no-op success. When requireExpiredLease is set the requeue
+	// additionally requires the lease to have lapsed — the wedged-owner
+	// trigger; a confirmed pod death requeues regardless.
+	//
+	// bumpAttempts controls the recovery-budget accounting: the GC requeue
+	// of a dead or wedged owner and a processor handing back a claimed batch
+	// each count one recovery attempt, but the startup-recovery requeue must
+	// pass false — PQClaimOwned already counted the restart, and counting
+	// both would spend two attempts of the budget per rollout.
+	RequeueResumableOrphan(ctx context.Context, batchID, processorID string, epoch int64, requireExpiredLease, bumpAttempts bool) error
 }
 
 // ResumableEntryStore tracks per-request state of a resumable batch.

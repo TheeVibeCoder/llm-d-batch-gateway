@@ -1090,7 +1090,7 @@ func TestRunJob_Resumable_MidRunOwnershipLoss(t *testing.T) {
 		req := <-env.asyncClient.submittedCh
 		submitted = append(submitted, req.RequestID)
 	}
-	if err := env.resumable.RequeueResumableOrphan(context.Background(), jobID, env.jobItem.ProcessorID, 2, false); err != nil {
+	if err := env.resumable.RequeueResumableOrphan(context.Background(), jobID, env.jobItem.ProcessorID, 2, false, true); err != nil {
 		t.Fatalf("RequeueResumableOrphan: %v", err)
 	}
 	for _, id := range submitted {

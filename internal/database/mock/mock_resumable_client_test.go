@@ -211,7 +211,7 @@ func TestMockResumableStore_Finalize(t *testing.T) {
 				fin: finOf("in_progress")},
 			{name: "requeued batch lost its owner",
 				mutate: func(store *MockResumableStore, _ *frozenClock) {
-					_ = store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, false)
+					_ = store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, false, true)
 				},
 				fin: finOf("in_progress")},
 		}
@@ -263,7 +263,7 @@ func TestMockResumableStore_Requeue(t *testing.T) {
 
 	t.Run("clears ownership, bumps epoch, keeps entries", func(t *testing.T) {
 		store, _ := seedActivated(t)
-		if err := store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, false); err != nil {
+		if err := store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, false, true); err != nil {
 			t.Fatalf("requeue: %v", err)
 		}
 		// The owner's fenced writes no longer match at the old epoch.
@@ -277,9 +277,31 @@ func TestMockResumableStore_Requeue(t *testing.T) {
 		}
 	})
 
+	t.Run("bumpAttempts=false leaves the recovery budget untouched", func(t *testing.T) {
+		// The startup-recovery requeue: PQClaimOwned already counted the
+		// restart, so the requeue must not spend a second attempt — one
+		// restart costs one attempt of the budget, not two.
+		store, _ := seedActivated(t)
+		if err := store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, false, false); err != nil {
+			t.Fatalf("requeue: %v", err)
+		}
+		if _, _, attempts := store.BatchOwnership("job-1"); attempts != 0 {
+			t.Fatalf("recovery_attempts = %d, want 0 (the claim already counted the restart)", attempts)
+		}
+
+		// The GC requeue still counts.
+		store2, _ := seedActivated(t)
+		if err := store2.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, false, true); err != nil {
+			t.Fatalf("requeue: %v", err)
+		}
+		if _, _, attempts := store2.BatchOwnership("job-1"); attempts != 1 {
+			t.Fatalf("recovery_attempts = %d, want 1 for a counted requeue", attempts)
+		}
+	})
+
 	t.Run("stale snapshot is a no-op", func(t *testing.T) {
 		store, _ := seedActivated(t)
-		if err := store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch-1, false); err != nil {
+		if err := store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch-1, false, true); err != nil {
 			t.Fatalf("stale requeue: %v", err)
 		}
 		if err := store.RenewResumableBatchLease(ctx, "job-1", "proc-1", activationEpoch, activationLeaseTTL); err != nil {
@@ -289,14 +311,14 @@ func TestMockResumableStore_Requeue(t *testing.T) {
 
 	t.Run("wedged-owner trigger requires a lapsed lease", func(t *testing.T) {
 		store, clock := seedActivated(t)
-		if err := store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, true); err != nil {
+		if err := store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, true, true); err != nil {
 			t.Fatalf("requeue with live lease: %v", err)
 		}
 		if err := store.RenewResumableBatchLease(ctx, "job-1", "proc-1", activationEpoch, activationLeaseTTL); err != nil {
 			t.Fatalf("live lease must block the requeue: %v", err)
 		}
 		clock.Advance(activationLeaseTTL + time.Minute)
-		if err := store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, true); err != nil {
+		if err := store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, true, true); err != nil {
 			t.Fatalf("requeue after lapse: %v", err)
 		}
 		if err := store.RenewResumableBatchLease(ctx, "job-1", "proc-1", activationEpoch, activationLeaseTTL); !errors.Is(err, api.ErrConflict) {
@@ -307,7 +329,7 @@ func TestMockResumableStore_Requeue(t *testing.T) {
 	t.Run("terminal batch is left alone", func(t *testing.T) {
 		store, _ := seedActivated(t)
 		store.MarkTerminal("job-1")
-		if err := store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, false); err != nil {
+		if err := store.RequeueResumableOrphan(ctx, "job-1", "proc-1", activationEpoch, false, true); err != nil {
 			t.Fatalf("requeue terminal: %v", err)
 		}
 		if err := store.RenewResumableBatchLease(ctx, "job-1", "proc-1", activationEpoch, activationLeaseTTL); !errors.Is(err, api.ErrConflict) {

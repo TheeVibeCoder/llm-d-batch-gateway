@@ -329,7 +329,7 @@ func TestRequeueResumableOrphanPG(t *testing.T) {
 		const id = "batch-requeue"
 		epoch := env.activate(t, id)
 
-		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, false); err != nil {
+		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, false, true); err != nil {
 			t.Fatalf("RequeueResumableOrphan: %v", err)
 		}
 
@@ -352,11 +352,41 @@ func TestRequeueResumableOrphanPG(t *testing.T) {
 		}
 	})
 
+	t.Run("startup requeue leaves the recovery budget to the claim", func(t *testing.T) {
+		// PQClaimOwned already bumps recovery_attempts when startup recovery
+		// claims the owned row, so the hand-back requeue must not bump again:
+		// one restart costs one attempt, not two — after two rollouts a
+		// healthy batch sits at 2, inside the default budget of 3.
+		const id = "batch-requeue-startup"
+		epoch := env.activate(t, id)
+		// The claim's bump, as PQClaimOwned would leave it.
+		if _, err := env.pool.Exec(env.ctx,
+			`UPDATE batch_items SET recovery_attempts = 1 WHERE id = $1`, id,
+		); err != nil {
+			t.Fatalf("stage claim bump: %v", err)
+		}
+
+		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, false, false); err != nil {
+			t.Fatalf("RequeueResumableOrphan: %v", err)
+		}
+
+		s := readRow(t, id)
+		if s.processor != nil {
+			t.Fatalf("ownership not cleared: processor=%v", s.processor)
+		}
+		if s.epoch != epoch+1 {
+			t.Fatalf("epoch not bumped: got %d want %d", s.epoch, epoch+1)
+		}
+		if s.attempts != 1 {
+			t.Fatalf("recovery_attempts = %d, want 1 (only the claim's bump)", s.attempts)
+		}
+	})
+
 	t.Run("no-ops when the snapshot is stale", func(t *testing.T) {
 		const id = "batch-requeue-race"
 		epoch := env.activate(t, id)
 
-		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch+5, false); err != nil {
+		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch+5, false, true); err != nil {
 			t.Fatalf("stale snapshot must be a no-op success, got %v", err)
 		}
 		if s := readRow(t, id); s.processor == nil || *s.processor != testProcessorID {
@@ -368,7 +398,7 @@ func TestRequeueResumableOrphanPG(t *testing.T) {
 		const id = "batch-requeue-wedged"
 		epoch := env.activate(t, id)
 
-		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, true); err != nil {
+		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, true, true); err != nil {
 			t.Fatalf("RequeueResumableOrphan: %v", err)
 		}
 		if s := readRow(t, id); s.processor == nil {
@@ -376,7 +406,7 @@ func TestRequeueResumableOrphanPG(t *testing.T) {
 		}
 
 		env.expireLease(t, id)
-		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, true); err != nil {
+		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, true, true); err != nil {
 			t.Fatalf("RequeueResumableOrphan: %v", err)
 		}
 		if s := readRow(t, id); s.processor != nil {
@@ -393,7 +423,7 @@ func TestRequeueResumableOrphanPG(t *testing.T) {
 			t.Fatalf("claim: %v", err)
 		}
 
-		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, 0, false); err != nil {
+		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, 0, false, true); err != nil {
 			t.Fatalf("RequeueResumableOrphan: %v", err)
 		}
 		if s := readRow(t, id); s.processor == nil || *s.processor != testProcessorID {
@@ -520,7 +550,7 @@ func TestFinalizeResumableBatchPG(t *testing.T) {
 	t.Run("requeued zombie cannot finalize", func(t *testing.T) {
 		const id = "batch-fin-zombie"
 		epoch := env.activate(t, id)
-		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, false); err != nil {
+		if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, false, true); err != nil {
 			t.Fatalf("RequeueResumableOrphan: %v", err)
 		}
 

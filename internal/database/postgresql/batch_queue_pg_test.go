@@ -27,7 +27,7 @@ import (
 func (env *resumablePgEnv) requeuedResumableBatch(t *testing.T, id string) int64 {
 	t.Helper()
 	epoch := env.activate(t, id)
-	if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, false); err != nil {
+	if err := env.store.RequeueResumableOrphan(env.ctx, id, testProcessorID, epoch, false, true); err != nil {
 		t.Fatalf("RequeueResumableOrphan: %v", err)
 	}
 	return epoch + 1

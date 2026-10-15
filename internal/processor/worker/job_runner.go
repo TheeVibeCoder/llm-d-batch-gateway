@@ -145,7 +145,7 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 			if params.task.Resumable {
 				// PQEnqueue refuses resumable rows; hand the batch back the
 				// way the reconciler does so the dequeue can reclaim it.
-				if reqErr := p.resumable.RequeueResumableOrphan(bgCtx, params.task.ID, params.jobItem.ProcessorID, params.jobItem.Epoch, false); reqErr != nil {
+				if reqErr := p.resumable.RequeueResumableOrphan(bgCtx, params.task.ID, params.jobItem.ProcessorID, params.jobItem.Epoch, false, true); reqErr != nil {
 					logger.Error(reqErr, "Failed to requeue the resumable job; leaving it to the reconciler")
 				} else {
 					metrics.RecordJobProcessed(metrics.ResultReEnqueued, metrics.ReasonSystemError)

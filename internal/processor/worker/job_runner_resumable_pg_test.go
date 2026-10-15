@@ -125,7 +125,7 @@ func TestRunJob_Resumable_RequeueClaimResume(t *testing.T) {
 	}
 
 	// The reconciler requeues the orphan, as the GC reconciler would.
-	if err := resumable.RequeueResumableOrphan(ctx, jobID, processorID, 1, false); err != nil {
+	if err := resumable.RequeueResumableOrphan(ctx, jobID, processorID, 1, false, true); err != nil {
 		t.Fatalf("RequeueResumableOrphan: %v", err)
 	}
 

@@ -120,8 +120,10 @@ func (p *Processor) recoverOwnedJobs(ctx context.Context) error {
 	return nil
 }
 
-// maxRecoveryAttempts bounds how often one ownership may recover a job before
-// it is failed with whatever partial results survived.
+// maxRecoveryAttempts bounds how often a batch may be recovered — claimed
+// again after losing or handing back its owner — before it is failed with
+// whatever partial results survived. One restart costs one attempt (the
+// startup claim), and each GC requeue of a dead or wedged owner counts one.
 const maxRecoveryAttempts = 3
 
 // recoverResumableOwned handles a resumable row claimed at startup. A
@@ -143,7 +145,10 @@ func (p *Processor) recoverResumableOwned(ctx context.Context, task *db.BatchJob
 		p.cleanupStaleJobDir(ctx, task.ID)
 		return nil
 	}
-	if err := p.resumable.RequeueResumableOrphan(ctx, task.ID, dbItem.ProcessorID, dbItem.Epoch, false); err != nil {
+	// The claim at startup already counted this restart against the
+	// recovery budget (PQClaimOwned), so the requeue must not add a second
+	// attempt: one restart costs one attempt, not two.
+	if err := p.resumable.RequeueResumableOrphan(ctx, task.ID, dbItem.ProcessorID, dbItem.Epoch, false, false); err != nil {
 		return fmt.Errorf("requeue resumable job: %w", err)
 	}
 	metrics.RecordStartupRecovery(string(p.getJobStatus(dbItem)), recoveryActionReEnqueue)

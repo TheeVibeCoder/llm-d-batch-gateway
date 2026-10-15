@@ -297,8 +297,10 @@ func (r *Reconciler) triageResumable(ctx context.Context, job *db.BatchItem, res
 	}
 
 	// A confirmed pod death requeues regardless of the lease; an alive owner
-	// is only displaced once its lease has actually lapsed.
-	if err := r.resumable.RequeueResumableOrphan(ctx, job.ID, job.ProcessorID, job.Epoch, ownerAlive); err != nil {
+	// is only displaced once its lease has actually lapsed. The requeue
+	// counts one recovery attempt: the owner failed, and the budget bounds
+	// how often a batch is handed around before it is failed.
+	if err := r.resumable.RequeueResumableOrphan(ctx, job.ID, job.ProcessorID, job.Epoch, ownerAlive, true); err != nil {
 		logger.Error(err, "Reconciler: failed to requeue resumable orphan")
 		result.Errors++
 		return
