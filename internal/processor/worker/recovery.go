@@ -356,7 +356,9 @@ func (p *Processor) routeResumedPickup(ctx context.Context, params *jobExecution
 	}
 
 	logger.V(logging.INFO).Info("Resumable pickup routed to terminal finalization", "status", status)
-	_ = p.finalizeResumableTerminal(ctx, params, status, notExecutedCode, expected)
+	if finErr := p.finalizeResumableTerminal(ctx, params, status, notExecutedCode, expected); finErr != nil {
+		logger.Error(finErr, "Failed to terminalize resumed pickup; leaving it for the reconciler")
+	}
 	return true
 }
 
