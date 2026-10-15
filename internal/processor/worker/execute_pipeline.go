@@ -53,7 +53,10 @@ func (u jobProgressUpdater) UpdateProgressCounts(ctx context.Context, jobID stri
 	return err
 }
 
-func (p *Processor) executeJobAsync(ctx context.Context, params *jobExecutionParams) (*openai.BatchRequestCounts, error) {
+// executeJob runs the unified dispatch pipeline: it streams the plan-file
+// source through the dispatcher (sync or async, chosen by buildRequestDispatcher)
+// and checkpoints every result through the sink.
+func (p *Processor) executeJob(ctx context.Context, params *jobExecutionParams) (*openai.BatchRequestCounts, error) {
 	logger := logr.FromContextOrDiscard(ctx)
 	logger.V(logging.INFO).Info("Starting execution (v2 pipeline)")
 

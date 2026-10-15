@@ -258,7 +258,7 @@ func (p *Processor) runJob(ctx context.Context, params *jobExecutionParams) {
 	// execution: execute inference requests
 	execCtx, execSpan := uotel.StartSpan(abortCtx, "execute-job")
 	var execErr error
-	requestCounts, execErr = p.executeJobAsync(execCtx, params)
+	requestCounts, execErr = p.executeJob(execCtx, params)
 	if execErr != nil && !batchctx.IsTerminal(execErr) {
 		execSpan.RecordError(execErr)
 		execSpan.SetStatus(codes.Error, "execution failed")
