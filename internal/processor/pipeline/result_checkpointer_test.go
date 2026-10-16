@@ -452,9 +452,9 @@ func TestResultCheckpointer_AckAfterCheckpoint(t *testing.T) {
 		tracker := new(ackTracker)
 		c := newCheckpointer(&fakeSink{}, pending)
 
-		// req-foreign was never submitted by this job: the broadcast reaches
-		// this checkpointer, but the owning job's checkpointer holds the
-		// same delivery and acknowledges after its own checkpoint.
+		// req-foreign was never submitted by this job. The per-request
+		// routing keeps foreign results out of this channel; the guard is
+		// defense in depth for any path that still delivers one.
 		ch := make(chan ResultItem, 1)
 		r := successResult("req-foreign")
 		r.CustomID = "" // async shape: enriched only when pending

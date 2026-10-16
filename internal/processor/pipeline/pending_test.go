@@ -329,3 +329,38 @@ func TestPendingRequests(t *testing.T) {
 		}
 	})
 }
+
+// TestPendingRequests_Has covers the per-request routing predicate: a
+// request is owned from its submission until its result's checkpoint
+// succeeds (Resolve); enrichment alone keeps the ownership.
+func TestPendingRequests_Has(t *testing.T) {
+	pending := NewPendingRequests(0)
+
+	if pending.Has("req-1") {
+		t.Fatal("unknown request reported as owned")
+	}
+
+	pending.Store(RequestItem{RequestID: "req-1", CustomID: "c-1"})
+	if !pending.Has("req-1") {
+		t.Fatal("submitted request not reported as owned")
+	}
+
+	// Enriching (a result arriving) keeps the ownership: the entry is
+	// released only when the result's checkpoint succeeded, so a
+	// redelivery between enrichment and checkpoint still routes here.
+	r := successResult("req-1")
+	if !pending.Enrich(&r) {
+		t.Fatal("expected the stored request to be enriched")
+	}
+	if !pending.Has("req-1") {
+		t.Fatal("enriched request no longer reported as owned")
+	}
+
+	// Resolving (the checkpoint succeeded) releases the ownership.
+	if !pending.Resolve(&r) {
+		t.Fatal("expected the enriched result to resolve")
+	}
+	if pending.Has("req-1") {
+		t.Fatal("resolved request still reported as owned")
+	}
+}

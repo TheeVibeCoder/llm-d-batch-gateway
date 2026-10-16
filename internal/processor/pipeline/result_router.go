@@ -26,9 +26,9 @@ func NewBroadcasterGroup(broadcasters []*ResultBroadcaster) *BroadcasterGroup {
 	return &BroadcasterGroup{broadcasters: broadcasters}
 }
 
-func (bs *BroadcasterGroup) Subscribe(ch chan<- ResultItem) {
+func (bs *BroadcasterGroup) Subscribe(ch chan<- ResultItem, owns func(string) bool) {
 	for _, b := range bs.broadcasters {
-		b.Subscribe(ch)
+		b.Subscribe(ch, owns)
 	}
 }
 
@@ -38,29 +38,33 @@ func (bs *BroadcasterGroup) Unsubscribe(ch chan<- ResultItem) {
 	}
 }
 
-// ResultBroadcaster reads results from a shared async client and
-// broadcasts to all subscribed channels.
+// ResultBroadcaster reads results from a shared async client and routes
+// each one to the subscriber that owns its request.
 type ResultBroadcaster struct {
 	client      inference.AsyncInferenceClient
-	subscribers *syncutil.MutexMap[chan<- ResultItem, struct{}]
+	subscribers *syncutil.MutexMap[chan<- ResultItem, func(string) bool]
 	logger      logr.Logger
 }
 
 func NewResultBroadcaster(client inference.AsyncInferenceClient, logger logr.Logger) *ResultBroadcaster {
 	return &ResultBroadcaster{
 		client:      client,
-		subscribers: syncutil.NewMutexMap[chan<- ResultItem, struct{}](),
+		subscribers: syncutil.NewMutexMap[chan<- ResultItem, func(string) bool](),
 		logger:      logger,
 	}
 }
 
-// Subscribe registers dest to receive all results.
-// dest should be buffered to avoid blocking the broadcaster.
-func (b *ResultBroadcaster) Subscribe(dest chan<- ResultItem) {
-	b.subscribers.Store(dest, struct{}{})
+// Subscribe registers dest to receive the results whose request it owns.
+// owns reports whether a request ID belongs to the subscriber (its pending
+// set); a nil owns accepts every result, the plain broadcast shape. dest is
+// handed each matching result from Run's delivery loop: a dest that is not
+// ready to receive delays result delivery for the whole route, so buffer it
+// enough to ride out consumer bursts.
+func (b *ResultBroadcaster) Subscribe(dest chan<- ResultItem, owns func(string) bool) {
+	b.subscribers.Store(dest, owns)
 }
 
-// Unsubscribe removes dest from the broadcast list.
+// Unsubscribe removes dest from the subscriber list.
 func (b *ResultBroadcaster) Unsubscribe(dest chan<- ResultItem) {
 	b.subscribers.Delete(dest)
 }
@@ -73,7 +77,8 @@ type receivedResult struct {
 	ack  func(ctx context.Context) error
 }
 
-// Run reads results and broadcasts to all subscribers.
+// Run reads results and routes each one to the subscriber that owns its
+// request, acknowledging unrouted residue itself.
 func (b *ResultBroadcaster) Run(ctx context.Context) {
 	incomingCh := make(chan receivedResult)
 
@@ -117,26 +122,45 @@ func (b *ResultBroadcaster) Run(ctx context.Context) {
 				return
 			}
 			result := asyncResult(received.resp, b.logger)
+			result.Ack = received.ack
 
-			subscribers := b.subscribers.Keys()
-			if len(subscribers) == 0 {
-				// No job in this processor awaits results on this model, so the
-				// delivery is residue — e.g. a late result for a batch that
-				// terminalized while its request was in flight. Acknowledge it
-				// instead of letting its lease bounce forever; jobs subscribe
-				// before submitting, so a subscriberless route holds no result a
-				// live job still wants.
-				if received.ack != nil {
-					if err := received.ack(ctx); err != nil {
-						b.logger.Info("Acknowledging unowned result failed; its lease will redeliver it",
-							"requestID", result.RequestID, "err", err)
-					}
+			// Per-request routing: only the subscriber that owns the request
+			// receives the delivery, so the ack is released by exactly one
+			// consumer — the owner, after its durable checkpoint. A request
+			// can only be in flight after its job subscribed and stored it,
+			// so an unrouted request belongs to no live job. The scan keeps
+			// going past a match: during a takeover, a fenced-out zombie and
+			// the new owner may both hold the request, and both must receive
+			// it — only the owner whose fence holds can commit and ack.
+			var targets []chan<- ResultItem
+			b.subscribers.Range(func(ch chan<- ResultItem, owns func(string) bool) bool {
+				if owns == nil || owns(result.RequestID) {
+					targets = append(targets, ch)
 				}
+				return true
+			})
+			// Send after Range returns: it holds the subscribers lock for
+			// the whole iteration, and a send blocked on a full channel must
+			// not stall Subscribe and Unsubscribe for the other jobs sharing
+			// the route. A send recovered from a closed-channel panic drops
+			// the result while its target still matched, so the delivery
+			// stays unacked and its lease redelivers it.
+			for _, ch := range targets {
+				b.safeChannelSend(result, ch)
+			}
+			if len(targets) > 0 {
 				continue
 			}
-			result.Ack = received.ack
-			for _, ch := range subscribers {
-				b.safeChannelSend(result, ch)
+			// Residue: no live job owns this request — e.g. a late result for
+			// a batch that terminalized while its request was in flight, or
+			// residue from an owner that crashed. Acknowledge it instead of
+			// letting its lease bounce forever; the destructive transport
+			// consumed it the same way.
+			if received.ack != nil {
+				if err := received.ack(ctx); err != nil {
+					b.logger.Info("Acknowledging unowned result failed; its lease will redeliver it",
+						"requestID", result.RequestID, "err", err)
+				}
 			}
 		}
 	}

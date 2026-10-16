@@ -40,7 +40,7 @@ func NewAsyncDispatcher(
 }
 
 func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem, resultCh chan<- ResultItem) error {
-	d.broadcasters.Subscribe(resultCh)
+	d.broadcasters.Subscribe(resultCh, d.pending.Has)
 
 	// Submit phase — fast queue writes.
 	for msg := range requestCh {
@@ -95,9 +95,10 @@ func (d *AsyncDispatcher) Run(ctx context.Context, requestCh <-chan RequestItem,
 		resultCh <- *msg.Error(code, message)
 	})
 
-	// Unsubscribe removes resultCh from the broadcast list. A concurrent
+	// Unsubscribe removes resultCh from the subscriber list. A concurrent
 	// send from the broadcaster may still race with close(resultCh);
-	// safeChannelSend recovers from the resulting panic.
+	// safeChannelSend recovers from the resulting panic and leaves the
+	// delivery unacked, so its lease redelivers it.
 	d.broadcasters.Unsubscribe(resultCh)
 	close(resultCh)
 

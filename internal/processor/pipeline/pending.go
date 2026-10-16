@@ -36,6 +36,16 @@ func (p *PendingRequests) Store(msg RequestItem) {
 	p.pending.Add(1)
 }
 
+// Has reports whether the request is still awaiting a result. It is the
+// broadcaster's per-request routing predicate and is non-destructive: the
+// entry is removed only when the result's checkpoint succeeded (Resolve),
+// so a redelivery arriving between the enrichment and the checkpoint still
+// routes to its owner instead of being consumed as residue.
+func (p *PendingRequests) Has(requestID string) bool {
+	_, ok := p.m.Load(requestID)
+	return ok
+}
+
 func (p *PendingRequests) decrement() {
 	if p.pending.Add(-1) == 0 {
 		select {

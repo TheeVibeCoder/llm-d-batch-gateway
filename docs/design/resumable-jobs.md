@@ -110,6 +110,10 @@ result accounting:
   the completed result instead of repeating its inference. A result whose
   checkpoint fails (or whose ownership was lost) is left unacked for exactly
   that redelivery; a duplicate is dropped by the first-wins entry commit.
+  Delivery is routed per request — only the job whose pending set owns the
+  request receives it — so exactly one consumer can release each
+  acknowledgement, and residue no live job owns is consumed by the
+  broadcaster itself instead of bouncing on its lease.
 - **Duplicate inference** is therefore possible only when a claimed delivery
   is lost outright — a result fetched by a dead or fenced-out owner that was
   never committed and whose claim lease also lapsed unrecoverably is

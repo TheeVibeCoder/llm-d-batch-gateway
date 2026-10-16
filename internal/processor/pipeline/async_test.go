@@ -333,7 +333,7 @@ func TestBroadcaster_RetriesTransientError(t *testing.T) {
 
 		broadcaster := NewResultBroadcaster(client, logr.Discard())
 		resultCh := make(chan ResultItem, 10)
-		broadcaster.Subscribe(resultCh)
+		broadcaster.Subscribe(resultCh, nil)
 
 		ctx, cancel := context.WithCancel(t.Context())
 		go broadcaster.Run(ctx)
@@ -980,7 +980,7 @@ func TestBroadcaster_DurableDeliveryCarriesAck(t *testing.T) {
 
 		broadcaster := NewResultBroadcaster(client, logr.Discard())
 		resultCh := make(chan ResultItem, 10)
-		broadcaster.Subscribe(resultCh)
+		broadcaster.Subscribe(resultCh, nil)
 
 		ctx, cancel := context.WithCancel(t.Context())
 		go broadcaster.Run(ctx)
@@ -1084,7 +1084,7 @@ func TestBroadcaster_FallsBackWhenDurableUnavailable(t *testing.T) {
 
 		broadcaster := NewResultBroadcaster(fallback, logr.Discard())
 		resultCh := make(chan ResultItem, 10)
-		broadcaster.Subscribe(resultCh)
+		broadcaster.Subscribe(resultCh, nil)
 
 		ctx, cancel := context.WithCancel(t.Context())
 		go broadcaster.Run(ctx)
@@ -1128,4 +1128,148 @@ type durableFallbackClient struct {
 
 func (c *durableFallbackClient) GetResult(ctx context.Context) (*inference.GenerateResponse, error) {
 	return c.getResult(ctx)
+}
+
+// TestBroadcaster_RoutesPerRequest covers the per-request routing: a result
+// reaches only the subscriber that owns its request, and a delivery no live
+// subscriber owns is acknowledged as residue even while another job is
+// subscribed to the same route — the bouncing-residue window of the plain
+// broadcast demux.
+func TestBroadcaster_RoutesPerRequest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ownerPending := NewPendingRequests(0)
+		ownerPending.Store(RequestItem{RequestID: "req-owned", CustomID: "c-owned"})
+		foreignPending := NewPendingRequests(0)
+		foreignPending.Store(RequestItem{RequestID: "req-foreign", CustomID: "c-foreign"})
+
+		var delivered atomic.Int32
+		residueAcked := make(chan string, 1)
+		client := &fakeDurableAsyncClient{
+			receive: func(ctx context.Context) (*inference.GenerateResponse, inference.ResultAck, error) {
+				if ctx.Err() != nil {
+					return nil, nil, ctx.Err()
+				}
+				switch delivered.Add(1) {
+				case 1:
+					return durableResponse("req-owned"), nil, nil
+				default:
+					return durableResponse("req-residue"), func(context.Context) error {
+						residueAcked <- "req-residue"
+						return nil
+					}, nil
+				}
+			},
+		}
+
+		broadcaster := NewResultBroadcaster(client, logr.Discard())
+		ownerCh := make(chan ResultItem, 10)
+		foreignCh := make(chan ResultItem, 10)
+		broadcaster.Subscribe(ownerCh, ownerPending.Has)
+		broadcaster.Subscribe(foreignCh, foreignPending.Has)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		go broadcaster.Run(ctx)
+		synctest.Wait()
+
+		// The owned result reaches its owner alone.
+		select {
+		case result := <-ownerCh:
+			if result.RequestID != "req-owned" {
+				t.Fatalf("owner received %q, want req-owned", result.RequestID)
+			}
+		default:
+			t.Fatal("the owning subscriber did not receive its result")
+		}
+		select {
+		case result := <-foreignCh:
+			t.Fatalf("foreign subscriber received %q, want nothing", result.RequestID)
+		default:
+		}
+
+		// The residue is consumed by the broadcaster itself, without waiting
+		// for the route to go idle.
+		select {
+		case id := <-residueAcked:
+			if id != "req-residue" {
+				t.Fatalf("acked residue = %q, want req-residue", id)
+			}
+		default:
+			t.Fatal("residue was not acknowledged while a live subscriber was routed around")
+		}
+		select {
+		case result := <-ownerCh:
+			t.Fatalf("owner received residue %q, want nothing", result.RequestID)
+		default:
+		}
+
+		cancel()
+	})
+}
+
+// TestBroadcaster_BlockedSendDoesNotStallSubscriptions pins the liveness
+// contract of the per-request routing: a send blocked on a subscriber that
+// stopped receiving must not hold the subscribers lock, so other jobs on
+// the same route can still subscribe and unsubscribe.
+func TestBroadcaster_BlockedSendDoesNotStallSubscriptions(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		blockedPending := NewPendingRequests(0)
+		blockedPending.Store(RequestItem{RequestID: "req-blocked", CustomID: "c-blocked"})
+
+		var delivered atomic.Int32
+		client := &fakeDurableAsyncClient{
+			receive: func(ctx context.Context) (*inference.GenerateResponse, inference.ResultAck, error) {
+				if ctx.Err() != nil {
+					return nil, nil, ctx.Err()
+				}
+				if delivered.Add(1) == 1 {
+					return durableResponse("req-blocked"), nil, nil
+				}
+				<-ctx.Done()
+				return nil, nil, ctx.Err()
+			},
+		}
+
+		broadcaster := NewResultBroadcaster(client, logr.Discard())
+		// blockedCh is never drained, so Run parks sending req-blocked to it.
+		blockedCh := make(chan ResultItem)
+		broadcaster.Subscribe(blockedCh, blockedPending.Has)
+		otherPending := NewPendingRequests(0)
+		otherCh := make(chan ResultItem, 1)
+		broadcaster.Subscribe(otherCh, otherPending.Has)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		go broadcaster.Run(ctx)
+		synctest.Wait()
+
+		subscribed := make(chan struct{})
+		go func() {
+			defer close(subscribed)
+			broadcaster.Subscribe(make(chan ResultItem, 1), otherPending.Has)
+		}()
+		unsubscribed := make(chan struct{})
+		go func() {
+			defer close(unsubscribed)
+			broadcaster.Unsubscribe(otherCh)
+		}()
+		synctest.Wait()
+
+		select {
+		case <-subscribed:
+		default:
+			t.Fatal("Subscribe stalled behind a send blocked on a full subscriber channel")
+		}
+		select {
+		case <-unsubscribed:
+		default:
+			t.Fatal("Unsubscribe stalled behind a send blocked on a full subscriber channel")
+		}
+
+		// Release the parked send — the delivery itself — so Run can observe
+		// the cancellation and exit.
+		result := <-blockedCh
+		if result.RequestID != "req-blocked" {
+			t.Fatalf("blocked subscriber received %q, want req-blocked", result.RequestID)
+		}
+		cancel()
+	})
 }
