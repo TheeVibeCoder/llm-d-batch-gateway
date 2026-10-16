@@ -258,10 +258,10 @@ func (c *PostgresResumableStore) FinalizeResumableBatch(ctx context.Context, fin
 		// document, so the fence failed.
 	case err != nil:
 		// The verification itself failed. Ownership is undetermined — the
-	// fenced UPDATE matched no rows, but this processor may still own the
-	// batch — so surface the transient error instead of a conflict: the
-	// caller retries the finalization rather than abandoning one it may
-	// still hold.
+		// fenced UPDATE matched no rows, but this processor may still own the
+		// batch — so surface the transient error instead of a conflict: the
+		// caller retries the finalization rather than abandoning one it may
+		// still hold.
 		return fmt.Errorf("FinalizeResumableBatch: verify committed status of %s: %w", fin.BatchID, err)
 	case jsonEqual(committed, fin.Status):
 		logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("FinalizeResumableBatch: already finalized",
