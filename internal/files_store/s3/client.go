@@ -18,6 +18,7 @@ limitations under the License.
 package s3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -349,7 +350,12 @@ func (w *s3StreamWriter) Commit(ctx context.Context) (*api.BatchFileMetadata, er
 // publish moves the staged object to its destination with an If-None-Match
 // conditional write, making the commit create-only: a writer that opened
 // its stream before the current owner published gets ErrFileExists instead
-// of replacing the winner's object.
+// of replacing the winner's object. The staged bytes are buffered first:
+// the SDK's S3 payload-hash middleware reads the PUT body to compute
+// x-amz-content-sha256 and rewinds it, so the body must be seekable — a
+// streaming GetObject body cannot be rewound, and plain-HTTP S3-compatible
+// endpoints (no unsigned-payload escape) cannot sign a streaming body.
+// Store publishes seekable bodies the same way.
 func (w *s3StreamWriter) publish(ctx context.Context) (*api.BatchFileMetadata, error) {
 	staged, err := w.s3Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(w.bucket),
@@ -358,18 +364,21 @@ func (w *s3StreamWriter) publish(ctx context.Context) (*api.BatchFileMetadata, e
 	if err != nil {
 		return nil, fmt.Errorf("open staged object %s: %w", w.stagingKey, err)
 	}
-	defer staged.Body.Close()
-
-	var size int64
-	if staged.ContentLength != nil {
-		size = *staged.ContentLength
+	buf, readErr := io.ReadAll(staged.Body)
+	closeErr := staged.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("read staged object %s: %w", w.stagingKey, readErr)
 	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close staged object %s: %w", w.stagingKey, closeErr)
+	}
+	size := int64(len(buf))
 
 	_, err = w.s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(w.bucket),
 		Key:           aws.String(w.key),
-		Body:          staged.Body,
-		ContentLength: staged.ContentLength,
+		Body:          bytes.NewReader(buf),
+		ContentLength: aws.Int64(size),
 		IfNoneMatch:   aws.String("*"),
 	})
 	if err != nil {
