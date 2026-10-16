@@ -71,12 +71,18 @@ func (c *ResultCheckpointer) setPersistenceFailureHook(fn func()) {
 // keeps reading after a write error (the dispatcher blocks if nobody reads)
 // and returns the first error after the channel closes. A result whose
 // checkpoint fails stays pending: its entry is not terminal, so a later
-// resume re-submits it.
+// resume re-submits it. Durable deliveries are acknowledged only once
+// accounted for — a checkpointed result (or a duplicate whose earlier
+// delivery was checkpointed) is acked; a failed one is left unacked so its
+// lease redelivers it instead of replaying the inference.
 func (c *ResultCheckpointer) Drain(ctx context.Context, resultCh <-chan ResultItem) error {
 	var firstErr error
 	var conflictErr error
 	for msg := range resultCh {
 		if !c.pending.Enrich(&msg) {
+			// A broadcast result that belongs to another job sharing the
+			// client: its owner acknowledges after its own checkpoint, so
+			// leave the delivery alone here.
 			continue
 		}
 		if !msg.SubmittedAt.IsZero() {
@@ -85,6 +91,8 @@ func (c *ResultCheckpointer) Drain(ctx context.Context, resultCh <-chan ResultIt
 			metrics.RecordModelRequestExecutionDuration(time.Since(msg.SubmittedAt), msg.ModelID)
 		}
 		if firstErr != nil || conflictErr != nil {
+			// Not accounted for: leave the delivery unacked so lease expiry
+			// redelivers it (to this run's retry or a resumed incarnation).
 			continue
 		}
 		if err := c.checkpoint(ctx, &msg); err != nil {
@@ -103,6 +111,17 @@ func (c *ResultCheckpointer) Drain(ctx context.Context, resultCh <-chan ResultIt
 			c.logger.Error(err, "Persistence failure, skipping further writes")
 			if c.onPersistenceFailure != nil {
 				c.onPersistenceFailure()
+			}
+			continue
+		}
+		// Durably accounted for (committed, or a duplicate whose earlier
+		// delivery was): acknowledging releases the delivery; a failed ack
+		// only risks a duplicate redelivery, which the first-wins entry
+		// commit drops.
+		if msg.Ack != nil {
+			if err := msg.Ack(ctx); err != nil {
+				c.logger.Info("Result delivery acknowledgement failed; its lease will redeliver it and the duplicate is dropped on commit",
+					"requestID", msg.RequestID, "err", err)
 			}
 		}
 	}

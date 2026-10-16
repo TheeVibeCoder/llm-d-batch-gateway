@@ -930,3 +930,202 @@ func TestAsyncDispatcher_BeforeSubmit(t *testing.T) {
 		}
 	})
 }
+
+// fakeDurableAsyncClient serves results through the durable-delivery
+// capability instead of GetResult.
+type fakeDurableAsyncClient struct {
+	receive func(ctx context.Context) (*inference.GenerateResponse, inference.ResultAck, error)
+}
+
+var _ inference.AsyncInferenceClient = (*fakeDurableAsyncClient)(nil)
+var _ inference.DurableResultClient = (*fakeDurableAsyncClient)(nil)
+
+func (c *fakeDurableAsyncClient) Submit(_ context.Context, _ *inference.GenerateRequest) *inference.ClientError {
+	return nil
+}
+
+func (c *fakeDurableAsyncClient) GetResult(_ context.Context) (*inference.GenerateResponse, error) {
+	return nil, errors.New("GetResult must not be used on a durable client")
+}
+
+func (c *fakeDurableAsyncClient) ReceiveResult(ctx context.Context) (*inference.GenerateResponse, inference.ResultAck, error) {
+	return c.receive(ctx)
+}
+
+func (c *fakeDurableAsyncClient) Cancel(_ context.Context, _ []string) error { return nil }
+func (c *fakeDurableAsyncClient) Close() error                               { return nil }
+
+func durableResponse(requestID string) *inference.GenerateResponse {
+	resp, _ := json.Marshal(map[string]any{"ok": true})
+	return &inference.GenerateResponse{RequestID: requestID, Response: resp}
+}
+
+// TestBroadcaster_DurableDeliveryCarriesAck verifies the broadcaster prefers
+// the durable leased delivery and hands its acknowledgement to the consumer
+// with the result, so the ack happens only after the durable checkpoint.
+func TestBroadcaster_DurableDeliveryCarriesAck(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var acked atomic.Int32
+		client := &fakeDurableAsyncClient{
+			receive: func(ctx context.Context) (*inference.GenerateResponse, inference.ResultAck, error) {
+				if ctx.Err() != nil {
+					return nil, nil, ctx.Err()
+				}
+				return durableResponse("req-1"), func(context.Context) error {
+					acked.Add(1)
+					return nil
+				}, nil
+			},
+		}
+
+		broadcaster := NewResultBroadcaster(client, logr.Discard())
+		resultCh := make(chan ResultItem, 10)
+		broadcaster.Subscribe(resultCh)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		go broadcaster.Run(ctx)
+		synctest.Wait()
+
+		select {
+		case result := <-resultCh:
+			if result.RequestID != "req-1" {
+				t.Fatalf("RequestID = %q, want req-1", result.RequestID)
+			}
+			if result.Ack == nil {
+				t.Fatal("durable delivery must carry its acknowledgement")
+			}
+			if err := result.Ack(context.Background()); err != nil {
+				t.Fatalf("ack: %v", err)
+			}
+			if acked.Load() != 1 {
+				t.Fatalf("ack reached the delivery %d times, want 1", acked.Load())
+			}
+		default:
+			t.Fatal("no result broadcast from the durable delivery")
+		}
+
+		cancel()
+		for {
+			synctest.Wait()
+			select {
+			case <-resultCh:
+			default:
+				return
+			}
+		}
+	})
+}
+
+// TestBroadcaster_AcksResidueWithoutSubscribers covers the residue shape: a
+// delivery that arrives when no job is subscribed belongs to no live
+// consumer, so the broadcaster acknowledges it instead of letting its lease
+// bounce forever — the destructive transport consumed it the same way.
+func TestBroadcaster_AcksResidueWithoutSubscribers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		acked := make(chan string, 1)
+		client := &fakeDurableAsyncClient{
+			receive: func(ctx context.Context) (*inference.GenerateResponse, inference.ResultAck, error) {
+				if ctx.Err() != nil {
+					return nil, nil, ctx.Err()
+				}
+				return durableResponse("req-residue"), func(context.Context) error {
+					acked <- "req-residue"
+					return nil
+				}, nil
+			},
+		}
+
+		broadcaster := NewResultBroadcaster(client, logr.Discard())
+		// No subscriber: the residue shape.
+
+		ctx, cancel := context.WithCancel(t.Context())
+		go broadcaster.Run(ctx)
+		synctest.Wait()
+
+		select {
+		case id := <-acked:
+			if id != "req-residue" {
+				t.Fatalf("acked = %q, want req-residue", id)
+			}
+		default:
+			t.Fatal("broadcaster did not consume the unowned delivery")
+		}
+
+		cancel()
+	})
+}
+
+// TestBroadcaster_FallsBackWhenDurableUnavailable verifies the additive
+// capability: a client whose transport lacks durable delivery falls back to
+// the destructive GetResult contract.
+func TestBroadcaster_FallsBackWhenDurableUnavailable(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var getResultCalls atomic.Int32
+		client := &fakeDurableAsyncClient{
+			receive: func(ctx context.Context) (*inference.GenerateResponse, inference.ResultAck, error) {
+				if ctx.Err() != nil {
+					return nil, nil, ctx.Err()
+				}
+				return nil, nil, inference.ErrDurableResultsUnavailable
+			},
+		}
+		// The same client type routes the fallback through GetResult when the
+		// durable capability reports itself unavailable.
+		fallback := &durableFallbackClient{
+			fakeDurableAsyncClient: client,
+			getResult: func(ctx context.Context) (*inference.GenerateResponse, error) {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				getResultCalls.Add(1)
+				return durableResponse("req-1"), nil
+			},
+		}
+
+		broadcaster := NewResultBroadcaster(fallback, logr.Discard())
+		resultCh := make(chan ResultItem, 10)
+		broadcaster.Subscribe(resultCh)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		go broadcaster.Run(ctx)
+		synctest.Wait()
+
+		select {
+		case result := <-resultCh:
+			if result.RequestID != "req-1" {
+				t.Fatalf("RequestID = %q, want req-1", result.RequestID)
+			}
+			if result.Ack != nil {
+				t.Fatal("destructive fallback must not carry an ack")
+			}
+		default:
+			t.Fatal("no result broadcast from the fallback")
+		}
+		if getResultCalls.Load() == 0 {
+			t.Fatal("GetResult was not used as the fallback")
+		}
+
+		cancel()
+		for {
+			synctest.Wait()
+			select {
+			case <-resultCh:
+			default:
+				return
+			}
+		}
+	})
+}
+
+// durableFallbackClient pairs an unavailable durable capability with a
+// working destructive GetResult, the shape of a client whose transport lacks
+// durable delivery behind a client that always implements the capability
+// interface.
+type durableFallbackClient struct {
+	*fakeDurableAsyncClient
+	getResult func(ctx context.Context) (*inference.GenerateResponse, error)
+}
+
+func (c *durableFallbackClient) GetResult(ctx context.Context) (*inference.GenerateResponse, error) {
+	return c.getResult(ctx)
+}

@@ -104,11 +104,18 @@ result accounting:
 - A request is re-submitted after a disruption unless its result was already
   committed to an entries row. Committed results are never re-run and appear
   exactly once in the output artifact (strict ordinal order, verified hashes).
-- **Duplicate inference** is therefore possible, and the window is bounded by
-  lease alignment: a result fetched by a dead or fenced-out owner that was
-  never committed is re-inferred by the new owner; a committed result is not.
-  The worst case is one duplicate dispatch per non-terminal request per
-  takeover, not per retry tick.
+- **Async results are consumed durably** (llm-d-async ≥ v1.0.0): each result
+  is claimed under a lease and acknowledged only after its durable
+  checkpoint, so a crash between the delivery and the checkpoint redelivers
+  the completed result instead of repeating its inference. A result whose
+  checkpoint fails (or whose ownership was lost) is left unacked for exactly
+  that redelivery; a duplicate is dropped by the first-wins entry commit.
+- **Duplicate inference** is therefore possible only when a claimed delivery
+  is lost outright — a result fetched by a dead or fenced-out owner that was
+  never committed and whose claim lease also lapsed unrecoverably is
+  re-inferred by the new owner; a committed result is not. The worst case is
+  one duplicate dispatch per non-terminal request per takeover, not per
+  retry tick.
 - A disrupted incarnation's queued submissions are **never cancelled**: the
   queue reports a cancelled request as a `CANCELLED` result, and the next
   incarnation — which re-submits the same stable request IDs — would

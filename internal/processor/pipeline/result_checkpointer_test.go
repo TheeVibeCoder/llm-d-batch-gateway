@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -298,4 +299,194 @@ func sinkLines(t *testing.T, sink *fakeSink, wantErr bool) []byte {
 		buf = append(buf, line...)
 	}
 	return buf
+}
+
+// ackTracker records durable-delivery acknowledgements and their ordering
+// against checkpoint events.
+type ackTracker struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (t *ackTracker) checkpoint(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.events = append(t.events, "checkpoint:"+id)
+}
+
+func (t *ackTracker) ackFor(id string) func(context.Context) error {
+	return func(context.Context) error {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		t.events = append(t.events, "ack:"+id)
+		return nil
+	}
+}
+
+func (t *ackTracker) acked() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var ids []string
+	for _, e := range t.events {
+		if id, ok := strings.CutPrefix(e, "ack:"); ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func (t *ackTracker) snapshot() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.events...)
+}
+
+// TestResultCheckpointer_AckAfterCheckpoint covers the durable-delivery
+// acknowledgement contract: an ack is released only once the result is
+// durably accounted for — never before the checkpoint, never for a failed
+// checkpoint, and never for a result another job owns.
+func TestResultCheckpointer_AckAfterCheckpoint(t *testing.T) {
+	newCheckpointer := func(sink *fakeSink, pending *PendingRequests) *ResultCheckpointer {
+		return NewResultCheckpointer(sink, pending, NewProgressTracker(4, nil, "test-job", 0, logr.Discard()), logr.Discard())
+	}
+
+	t.Run("acks a committed checkpoint and a dropped duplicate, after the checkpoint", func(t *testing.T) {
+		pending := NewPendingRequests(0)
+		tracker := new(ackTracker)
+		sink := &fakeSink{}
+		sink.fn = func(msg *ResultItem) (bool, error) {
+			tracker.checkpoint(msg.RequestID)
+			if msg.RequestID == "req-dup" {
+				return false, nil // duplicate delivery: already terminal
+			}
+			return true, nil
+		}
+		c := newCheckpointer(sink, pending)
+
+		for _, id := range []string{"req-1", "req-dup"} {
+			pending.Store(RequestItem{RequestID: id, CustomID: "c-" + id})
+		}
+		ch := make(chan ResultItem, 2)
+		for _, id := range []string{"req-1", "req-dup"} {
+			r := successResult(id)
+			r.Ack = tracker.ackFor(id)
+			ch <- r
+		}
+		close(ch)
+
+		if err := c.Drain(context.Background(), ch); err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+		if got := tracker.acked(); len(got) != 2 {
+			t.Fatalf("acked = %v, want both results (a duplicate is durably accounted by its earlier delivery)", got)
+		}
+		// The ack of each result follows its checkpoint.
+		events := tracker.snapshot()
+		for _, id := range []string{"req-1", "req-dup"} {
+			var cp, ak = -1, -1
+			for i, e := range events {
+				if e == "checkpoint:"+id {
+					cp = i
+				}
+				if e == "ack:"+id {
+					ak = i
+				}
+			}
+			if cp == -1 || ak == -1 || ak < cp {
+				t.Fatalf("events = %v: %s must be acked after its checkpoint", events, id)
+			}
+		}
+	})
+
+	t.Run("leaves a failed checkpoint unacked for redelivery", func(t *testing.T) {
+		pending := NewPendingRequests(0)
+		tracker := new(ackTracker)
+		sink := &fakeSink{}
+		sink.fn = func(msg *ResultItem) (bool, error) {
+			tracker.checkpoint(msg.RequestID)
+			return false, errors.New("s3 down")
+		}
+		c := newCheckpointer(sink, pending)
+
+		pending.Store(RequestItem{RequestID: "req-1", CustomID: "c-1"})
+		ch := make(chan ResultItem, 1)
+		r := successResult("req-1")
+		r.Ack = tracker.ackFor("req-1")
+		ch <- r
+		close(ch)
+
+		if err := c.Drain(context.Background(), ch); err == nil {
+			t.Fatal("expected the checkpoint failure to surface")
+		}
+		if got := tracker.acked(); len(got) != 0 {
+			t.Fatalf("acked = %v, want none (lease expiry must redeliver the result)", got)
+		}
+	})
+
+	t.Run("leaves an ownership conflict unacked", func(t *testing.T) {
+		pending := NewPendingRequests(0)
+		tracker := new(ackTracker)
+		sink := &fakeSink{}
+		sink.fn = func(msg *ResultItem) (bool, error) {
+			return false, fmt.Errorf("entry %s: %w", msg.RequestID, db.ErrConflict)
+		}
+		c := newCheckpointer(sink, pending)
+
+		pending.Store(RequestItem{RequestID: "req-1", CustomID: "c-1"})
+		ch := make(chan ResultItem, 1)
+		r := successResult("req-1")
+		r.Ack = tracker.ackFor("req-1")
+		ch <- r
+		close(ch)
+
+		if err := c.Drain(context.Background(), ch); !errors.Is(err, db.ErrConflict) {
+			t.Fatalf("Drain error = %v, want ErrConflict", err)
+		}
+		if got := tracker.acked(); len(got) != 0 {
+			t.Fatalf("acked = %v, want none (the new owner consumes the redelivery)", got)
+		}
+	})
+
+	t.Run("does not acknowledge a result another job owns", func(t *testing.T) {
+		pending := NewPendingRequests(0)
+		tracker := new(ackTracker)
+		c := newCheckpointer(&fakeSink{}, pending)
+
+		// req-foreign was never submitted by this job: the broadcast reaches
+		// this checkpointer, but the owning job's checkpointer holds the
+		// same delivery and acknowledges after its own checkpoint.
+		ch := make(chan ResultItem, 1)
+		r := successResult("req-foreign")
+		r.CustomID = "" // async shape: enriched only when pending
+		r.Ack = tracker.ackFor("req-foreign")
+		ch <- r
+		close(ch)
+
+		if err := c.Drain(context.Background(), ch); err != nil {
+			t.Fatalf("Drain: %v", err)
+		}
+		if got := tracker.acked(); len(got) != 0 {
+			t.Fatalf("acked = %v, want none (the owning job acknowledges)", got)
+		}
+	})
+
+	t.Run("a failed ack is tolerated", func(t *testing.T) {
+		pending := NewPendingRequests(0)
+		sink := &fakeSink{}
+		c := newCheckpointer(sink, pending)
+
+		pending.Store(RequestItem{RequestID: "req-1", CustomID: "c-1"})
+		ch := make(chan ResultItem, 1)
+		r := successResult("req-1")
+		r.Ack = func(context.Context) error { return errors.New("lease expired") }
+		ch <- r
+		close(ch)
+
+		if err := c.Drain(context.Background(), ch); err != nil {
+			t.Fatalf("Drain: %v (a failed ack only risks a duplicate redelivery)", err)
+		}
+		if got := sink.len(); got != 1 {
+			t.Fatalf("committed checkpoints = %d, want 1", got)
+		}
+	})
 }

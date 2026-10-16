@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -64,16 +65,24 @@ func (b *ResultBroadcaster) Unsubscribe(dest chan<- ResultItem) {
 	b.subscribers.Delete(dest)
 }
 
+// receivedResult pairs one pulled result with the acknowledgement of its
+// durable delivery (nil on destructive transports). The ack travels with the
+// result so the consumer that accounts for it can acknowledge afterwards.
+type receivedResult struct {
+	resp *inference.GenerateResponse
+	ack  func(ctx context.Context) error
+}
+
 // Run reads results and broadcasts to all subscribers.
 func (b *ResultBroadcaster) Run(ctx context.Context) {
-	incomingCh := make(chan *inference.GenerateResponse)
+	incomingCh := make(chan receivedResult)
 
 	go func() {
 		defer close(incomingCh)
 		backoff := 100 * time.Millisecond
 		const maxBackoff = 10 * time.Second
 		for ctx.Err() == nil {
-			resp, err := b.client.GetResult(ctx)
+			received, err := b.receive(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -89,8 +98,10 @@ func (b *ResultBroadcaster) Run(ctx context.Context) {
 			}
 			backoff = 100 * time.Millisecond
 			select {
-			case incomingCh <- resp:
+			case incomingCh <- received:
 			case <-ctx.Done():
+				// Unrouted delivery: leave it unacked so lease expiry
+				// redelivers it to whoever runs next.
 				return
 			}
 		}
@@ -101,17 +112,49 @@ func (b *ResultBroadcaster) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 
-		case resp, ok := <-incomingCh:
+		case received, ok := <-incomingCh:
 			if !ok {
 				return
 			}
-			result := asyncResult(resp, b.logger)
+			result := asyncResult(received.resp, b.logger)
 
-			for _, ch := range b.subscribers.Keys() {
+			subscribers := b.subscribers.Keys()
+			if len(subscribers) == 0 {
+				// No job in this processor awaits results on this model, so the
+				// delivery is residue — e.g. a late result for a batch that
+				// terminalized while its request was in flight. Acknowledge it
+				// instead of letting its lease bounce forever; jobs subscribe
+				// before submitting, so a subscriberless route holds no result a
+				// live job still wants.
+				if received.ack != nil {
+					if err := received.ack(ctx); err != nil {
+						b.logger.Info("Acknowledging unowned result failed; its lease will redeliver it",
+							"requestID", result.RequestID, "err", err)
+					}
+				}
+				continue
+			}
+			result.Ack = received.ack
+			for _, ch := range subscribers {
 				b.safeChannelSend(result, ch)
 			}
 		}
 	}
+}
+
+// receive pulls one result, preferring the durable leased delivery: the
+// acknowledgement travels with the result so its consumer acknowledges only
+// after durably accounting for it. Transports without the capability keep
+// the destructive GetResult contract.
+func (b *ResultBroadcaster) receive(ctx context.Context) (receivedResult, error) {
+	if dc, ok := b.client.(inference.DurableResultClient); ok {
+		resp, ack, err := dc.ReceiveResult(ctx)
+		if err == nil || !errors.Is(err, inference.ErrDurableResultsUnavailable) {
+			return receivedResult{resp: resp, ack: ack}, err
+		}
+	}
+	resp, err := b.client.GetResult(ctx)
+	return receivedResult{resp: resp}, err
 }
 
 // safeChannelSend sends to ch and recovers from the panic if the channel
