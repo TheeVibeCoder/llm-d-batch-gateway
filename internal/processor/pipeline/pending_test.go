@@ -364,3 +364,40 @@ func TestPendingRequests_Has(t *testing.T) {
 		t.Fatal("resolved request still reported as owned")
 	}
 }
+
+// TestPendingRequests_StoreIdempotent pins the recovery pre-store contract:
+// storing the same request twice — the source's pre-store before the
+// dispatcher's store at (re-)submission — counts one pending entry, and the
+// later store's metadata wins.
+func TestPendingRequests_StoreIdempotent(t *testing.T) {
+	pending := NewPendingRequests(2)
+
+	pending.Store(RequestItem{RequestID: "req-1", CustomID: "c-1"})
+	pending.Store(RequestItem{RequestID: "req-1", CustomID: "c-1", ModelID: "m-1"})
+
+	if pending.Has("req-1") {
+		// Still owned: a single Store did not resolve anything.
+	} else {
+		t.Fatal("stored request not reported as owned")
+	}
+
+	r := successResult("req-1")
+	if !pending.Resolve(&r) {
+		t.Fatal("expected the stored request to resolve")
+	}
+	if pending.Has("req-1") {
+		t.Fatal("resolved request still reported as owned")
+	}
+
+	// The double store counted one pending entry, so one resolve drained it.
+	waited := make(chan struct{})
+	go func() {
+		pending.Wait(context.Background())
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pending not drained after a single resolve of a twice-stored request")
+	}
+}

@@ -50,12 +50,17 @@ func (s ResumableEntryStatus) IsTerminal() bool {
 // batch. Payloads live only in the file store; ResultKey/ResultBytes/
 // ResultSHA256 locate and verify the checkpointed result object.
 type ResumableEntry struct {
-	BatchID      string
-	RequestID    string
-	Ordinal      int64
-	CustomID     string
-	Status       ResumableEntryStatus
-	Attempts     int64
+	BatchID   string
+	RequestID string
+	Ordinal   int64
+	CustomID  string
+	Status    ResumableEntryStatus
+	Attempts  int64
+	// SubmittedBy records the processor that last marked the entry
+	// in_flight (the submitter): its per-processor async result route is
+	// where an unacknowledged delivery of the entry's result is stranded
+	// after a disruption, so the next owner recovers from there.
+	SubmittedBy  string
 	ResultKey    string
 	ResultBytes  int64
 	ResultSHA256 string
@@ -108,6 +113,14 @@ type ResumableResumeState struct {
 	Completed          int64
 	Failed             int64
 	TerminalRequestIDs []string
+	// InFlightSubmittedBy maps each in-flight entry's request ID to the
+	// processor that submitted it. The resuming owner pre-stores these
+	// entries and defers their re-submission for a recovery window: their
+	// results — completed, failed, or deadline-exceeded — arrive on the
+	// submitter's per-processor result route and are recovered through it
+	// instead of re-running inference. Entries with an unknown submitter
+	// (written before submitter tracking) are absent and re-submit directly.
+	InFlightSubmittedBy map[string]string
 }
 
 // ResumableBatchStore activates batches into the resumable pipeline.
@@ -195,6 +208,15 @@ type ResumableEntryStore interface {
 
 	// FindEntryByRequestID returns the entry, or nil when it does not exist.
 	FindEntryByRequestID(ctx context.Context, batchID, requestID string) (*ResumableEntry, error)
+
+	// HasOpenEntryByRequest reports whether any batch holds a non-terminal
+	// (pending or in_flight) entry for the request ID. The result
+	// broadcaster's residue check uses it to decide whether an unrouted
+	// delivery may be acknowledged: a delivery whose entry is open can still
+	// be accounted for by whichever processor recovers its batch, so it must
+	// stay unacknowledged for lease redelivery; only a delivery whose entry
+	// is terminal or absent is safe to discard.
+	HasOpenEntryByRequest(ctx context.Context, requestID string) (bool, error)
 }
 
 // ResumableStore combines the resumable batch, lease, and entry capabilities

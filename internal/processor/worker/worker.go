@@ -152,8 +152,10 @@ func (p *Processor) Run(ctx context.Context, onReady func()) error {
 
 	// If async inference is used (llm-d-async), set up a registry of ResultBroadcasters.
 	// These will propagate results from the async queues to the JobExecutor's individual result collectors.
+	// Unrouted deliveries are acknowledged only when the entry store proves no
+	// open entry can still account for them.
 	if p.asyncInference != nil {
-		bs := newBroadcasterRegistry(p.asyncInference, logger)
+		bs := newBroadcasterRegistry(p.asyncInference, logger, residueGate(p.resumable, residueCheckTimeout))
 		bs.Run(ctx)
 		defer bs.Wait()
 		p.broadcasters = bs

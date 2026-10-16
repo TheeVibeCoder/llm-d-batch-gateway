@@ -397,6 +397,15 @@ func (p *Processor) recoverResumable(
 			seed.TerminalRequestIDs = append(seed.TerminalRequestIDs, e.RequestID)
 		case db.ResumableEntryInFlight:
 			seed.InFlight++
+			// The submitter's per-processor result route holds the entry's
+			// unacknowledged delivery; the resuming owner recovers it from
+			// there instead of re-running the inference.
+			if e.SubmittedBy != "" {
+				if seed.InFlightSubmittedBy == nil {
+					seed.InFlightSubmittedBy = make(map[string]string)
+				}
+				seed.InFlightSubmittedBy[e.RequestID] = e.SubmittedBy
+			}
 		default:
 			seed.Pending++
 		}

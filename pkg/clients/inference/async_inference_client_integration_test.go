@@ -317,3 +317,125 @@ func TestAsyncSharedClient_ReceiveResult_durable(t *testing.T) {
 		}
 	})
 }
+
+// TestAsyncResolver_RecoveryClientFor_crossProcessor is the transport-layer
+// regression for cross-processor takeover (#742): processor A receives a
+// result under a claim lease and dies before checkpointing it; the lease
+// lapses; processor B — a different consumer identity that reclaimed the
+// batch — recovers the completed result from A's per-processor route
+// through RecoveryClientFor instead of re-running the inference.
+func TestAsyncResolver_RecoveryClientFor_crossProcessor(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	newResolver := func(consumer string) *AsyncGatewayResolver {
+		t.Helper()
+		resolver, err := NewAsyncResolver(AsyncClientConfig{
+			RedisURL:          "redis://" + mr.Addr(),
+			ConsumerID:        consumer,
+			ResultPollTimeout: 2 * time.Second,
+			Models: map[string]AsyncModelPoolConfig{
+				"m1": {PoolName: "xp-pool"},
+			},
+		}, testLogger(t))
+		if err != nil {
+			t.Fatalf("NewAsyncResolver(%s): %v", consumer, err)
+		}
+		t.Cleanup(func() { _ = resolver.Close() })
+		return resolver
+	}
+
+	owner := newResolver("proc-a")
+	recoverer := newResolver("proc-b")
+
+	// proc-a submits the request; its result route carries the delivery.
+	ownerClient := owner.SharedClientFor("m1")
+	if submitErr := ownerClient.Submit(context.Background(), &GenerateRequest{
+		RequestID: "req-x",
+		Endpoint:  "/v1/completions",
+		Params:    map[string]any{"model": "m1", "prompt": "hello"},
+	}); submitErr != nil {
+		t.Fatalf("Submit() error: %s", submitErr.Message)
+	}
+
+	ownerRoute := asyncQueuePrefix + "results:xp-pool:proc-a"
+	data, err := json.Marshal(api.ResultMessage{
+		ID:         "req-x",
+		StatusCode: 200,
+		Payload:    `{"choices":[{"text":"hello"}]}`,
+	})
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+	if _, lpushErr := mr.Lpush(ownerRoute, string(data)); lpushErr != nil {
+		t.Fatalf("Lpush: %v", lpushErr)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// proc-a claims the delivery, then dies before checkpointing: the ack
+	// is never called.
+	durableOwner, ok := ownerClient.(DurableResultClient)
+	if !ok {
+		t.Fatal("the shared async client must expose durable result delivery")
+	}
+	resp, ack, err := durableOwner.ReceiveResult(ctx)
+	if err != nil {
+		t.Fatalf("proc-a ReceiveResult: %v", err)
+	}
+	if resp.RequestID != "req-x" {
+		t.Fatalf("proc-a received %q, want req-x", resp.RequestID)
+	}
+	_ = ack // the crash window
+
+	// The claim lease lapses, as time passage would.
+	idxKey := ownerRoute + ":result-claims-idx"
+	members, err := rdb.ZRangeWithScores(ctx, idxKey, 0, -1).Result()
+	if err != nil || len(members) != 1 {
+		t.Fatalf("claims = %v (err %v), want the single unacked claim", members, err)
+	}
+	if _, err := rdb.ZAdd(ctx, idxKey, redis.Z{
+		Member: members[0].Member,
+		Score:  float64(time.Now().Add(-time.Hour).UnixMilli()),
+	}).Result(); err != nil {
+		t.Fatalf("backdate claim lease: %v", err)
+	}
+
+	// proc-b recovers the completed result from proc-a's route — no
+	// re-submission, no re-inference.
+	recoveryClient, err := recoverer.RecoveryClientFor("m1", "proc-a")
+	if err != nil {
+		t.Fatalf("RecoveryClientFor: %v", err)
+	}
+	recoveryDurable, ok := recoveryClient.(DurableResultClient)
+	if !ok {
+		t.Fatal("the recovery client must expose durable result delivery")
+	}
+	resp2, ack2, err := recoveryDurable.ReceiveResult(ctx)
+	if err != nil {
+		t.Fatalf("proc-b recovery ReceiveResult: %v", err)
+	}
+	if resp2.RequestID != "req-x" || resp2.StatusCode != 200 || resp2.Response == nil {
+		t.Fatalf("recovered response = %+v, want the completed req-x result", resp2)
+	}
+
+	// The recovering owner checkpointed the result, so it releases the ack.
+	if err := ack2(ctx); err != nil {
+		t.Fatalf("recovery ack: %v", err)
+	}
+	if n, zErr := rdb.ZCard(ctx, idxKey).Result(); zErr != nil || n != 0 {
+		t.Fatalf("claims after recovery ack = %d (err %v), want 0", n, zErr)
+	}
+
+	// The recovery route is drained: nothing is left stranded on proc-a.
+	if n, lErr := rdb.LLen(ctx, ownerRoute).Result(); lErr != nil || n != 0 {
+		t.Fatalf("pending after recovery = %d (err %v), want 0", n, lErr)
+	}
+
+	// A recovery client is receive-only garbage for unknown models.
+	if _, err := recoverer.RecoveryClientFor("nope", "proc-a"); err == nil {
+		t.Fatal("RecoveryClientFor for an unknown model must fail")
+	}
+}

@@ -30,9 +30,23 @@ func (p *PendingRequests) NumRequests() int64 {
 	return p.numRequests
 }
 
-// Store registers a request as pending an async result.
+// Store registers a request as pending an async result. Storing the same
+// request ID twice keeps a single pending count — recovery pre-stores an
+// entry before the dispatcher stores it again at (re-)submission — and
+// refreshes the stored item so a later store's metadata (e.g. SubmittedAt)
+// wins. The refresh is not atomic with a concurrent Resolve: if a Resolve
+// (LoadAndDelete + decrement) lands between the LoadOrStore and the refresh,
+// the refresh resurrects the map entry without a pending count. That is
+// benign by construction — the count only ever under-counts (#first-stores
+// minus #resolves), so Wait cannot hang, and any duplicate result for the
+// resurrected entry is dropped by the first-wins entry commit while
+// DrainUnresolved cleans the map entry. Do not "fix" this with an
+// unconditional increment: that would over-count and hang Wait.
 func (p *PendingRequests) Store(msg RequestItem) {
-	p.m.Store(msg.RequestID, msg)
+	if _, loaded := p.m.LoadOrStore(msg.RequestID, msg); loaded {
+		p.m.Store(msg.RequestID, msg)
+		return
+	}
 	p.pending.Add(1)
 }
 

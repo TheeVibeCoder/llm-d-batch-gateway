@@ -43,6 +43,10 @@ func (bs *BroadcasterGroup) Unsubscribe(ch chan<- ResultItem) {
 type ResultBroadcaster struct {
 	client      inference.AsyncInferenceClient
 	subscribers *syncutil.MutexMap[chan<- ResultItem, func(string) bool]
+	// residueSafe durably verifies an unrouted delivery before the
+	// broadcaster acknowledges it (nil acknowledges unconditionally —
+	// the plain broadcast shape).
+	residueSafe func(ctx context.Context, requestID string) (bool, error)
 	logger      logr.Logger
 }
 
@@ -62,6 +66,18 @@ func NewResultBroadcaster(client inference.AsyncInferenceClient, logger logr.Log
 // enough to ride out consumer bursts.
 func (b *ResultBroadcaster) Subscribe(dest chan<- ResultItem, owns func(string) bool) {
 	b.subscribers.Store(dest, owns)
+}
+
+// WithResidueSafetyCheck arms the durable verification for unrouted
+// deliveries. safe reports whether a delivery may be acknowledged — its
+// entry is terminal or absent, so no processor can still account for it.
+// A delivery whose entry is still open is left unacknowledged: its lease
+// redelivers it to whichever processor recovers its batch, so a completed
+// result is never discarded just because no local pending set owns it.
+// Without a check the broadcaster acknowledges residue unconditionally.
+func (b *ResultBroadcaster) WithResidueSafetyCheck(safe func(ctx context.Context, requestID string) (bool, error)) *ResultBroadcaster {
+	b.residueSafe = safe
+	return b
 }
 
 // Unsubscribe removes dest from the subscriber list.
@@ -153,13 +169,30 @@ func (b *ResultBroadcaster) Run(ctx context.Context) {
 			}
 			// Residue: no live job owns this request — e.g. a late result for
 			// a batch that terminalized while its request was in flight, or
-			// residue from an owner that crashed. Acknowledge it instead of
-			// letting its lease bounce forever; the destructive transport
-			// consumed it the same way.
+			// residue from an owner that crashed. Acknowledge it only when a
+			// durable check proves no entry can still account for it; the
+			// destructive transport consumed it the same way.
 			if received.ack != nil {
-				if err := received.ack(ctx); err != nil {
-					b.logger.Info("Acknowledging unowned result failed; its lease will redeliver it",
-						"requestID", result.RequestID, "err", err)
+				safe := true
+				if b.residueSafe != nil {
+					var err error
+					safe, err = b.residueSafe(ctx, result.RequestID)
+					if err != nil {
+						// Unverifiable is not safe: leave the delivery unacked so
+						// its lease redelivers it once the check can run again.
+						b.logger.Info("Residue safety check failed; leaving delivery for redelivery",
+							"requestID", result.RequestID, "err", err)
+						safe = false
+					}
+				}
+				if safe {
+					if err := received.ack(ctx); err != nil {
+						b.logger.Info("Acknowledging unowned result failed; its lease will redeliver it",
+							"requestID", result.RequestID, "err", err)
+					}
+				} else {
+					b.logger.Info("Unrouted delivery held unacked; its entry is still open",
+						"requestID", result.RequestID)
 				}
 			}
 		}

@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS batch_entries (
     status        TEXT        NOT NULL DEFAULT 'pending'
                   CHECK (status IN ('pending','in_flight','completed','failed')),
     attempts      BIGINT      NOT NULL DEFAULT 0,
+    submitted_by  TEXT,
     result_key    TEXT,
     result_bytes  BIGINT,
     result_sha256 TEXT,
@@ -113,6 +114,14 @@ CREATE TABLE IF NOT EXISTS batch_entries (
     CONSTRAINT fk_batch_entries_batch FOREIGN KEY (batch_id)
         REFERENCES batch_items(id) ON DELETE CASCADE
 );
+-- Schema migration for entries written before submitter tracking existed.
+ALTER TABLE batch_entries ADD COLUMN IF NOT EXISTS submitted_by TEXT;
 CREATE INDEX IF NOT EXISTS idx_batch_entries_ordinal ON batch_entries (batch_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_batch_entries_open
     ON batch_entries (batch_id) WHERE status IN ('pending','in_flight');
+-- Global lookup by request ID: request IDs are stable and batch-scoped
+-- (SHA-1 of batch ID + custom ID), so the residue check can resolve an
+-- unrouted delivery to its entry without knowing the batch. Not UNIQUE:
+-- creation is best-effort on upgrade; the residue check treats any open
+-- entry as "not safe to acknowledge", which is conservative under duplicates.
+CREATE INDEX IF NOT EXISTS idx_batch_entries_request_id ON batch_entries (request_id);

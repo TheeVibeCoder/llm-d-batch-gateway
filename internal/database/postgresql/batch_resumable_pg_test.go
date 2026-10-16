@@ -952,3 +952,80 @@ func TestSchemaBackfillSkipsRequeuedRows(t *testing.T) {
 		t.Fatalf("requeued row %s was not claimable after a schema re-run: %+v", id, tasks)
 	}
 }
+
+// TestResumableSubmitterTrackingPG pins the submitter bookkeeping that
+// cross-processor recovery routes on: MarkEntryInFlight records the
+// submitting processor, an orphan requeue backfills it for entries written
+// before submitter tracking, and HasOpenEntryByRequest resolves an unrouted
+// delivery to the open entry that can still account for it.
+func TestResumableSubmitterTrackingPG(t *testing.T) {
+	env := newResumablePgEnv(t)
+
+	const batchID = "batch-submitter"
+	epoch := env.activate(t, batchID)
+
+	t.Run("mark in flight records the submitter", func(t *testing.T) {
+		if _, err := env.store.MarkEntryInFlight(env.ctx, batchID, "batch_req_a", testProcessorID, epoch); err != nil {
+			t.Fatalf("MarkEntryInFlight: %v", err)
+		}
+		entry, err := env.store.FindEntryByRequestID(env.ctx, batchID, "batch_req_a")
+		if err != nil || entry == nil {
+			t.Fatalf("FindEntryByRequestID: entry=%v err=%v", entry, err)
+		}
+		if entry.SubmittedBy != testProcessorID {
+			t.Fatalf("SubmittedBy = %q, want %q", entry.SubmittedBy, testProcessorID)
+		}
+	})
+
+	t.Run("has open entry by request", func(t *testing.T) {
+		open, err := env.store.HasOpenEntryByRequest(env.ctx, "batch_req_a")
+		if err != nil || !open {
+			t.Fatalf("HasOpenEntryByRequest(in-flight) = %v (err %v), want true", open, err)
+		}
+		open, err = env.store.HasOpenEntryByRequest(env.ctx, "batch_req_b")
+		if err != nil || !open {
+			t.Fatalf("HasOpenEntryByRequest(pending) = %v (err %v), want true", open, err)
+		}
+		open, err = env.store.HasOpenEntryByRequest(env.ctx, "batch_req_unknown")
+		if err != nil || open {
+			t.Fatalf("HasOpenEntryByRequest(unknown) = %v (err %v), want false", open, err)
+		}
+
+		// A checkpointed entry can no longer account for a delivery.
+		if _, err := env.store.MarkEntryInFlight(env.ctx, batchID, "batch_req_b", testProcessorID, epoch); err != nil {
+			t.Fatalf("MarkEntryInFlight: %v", err)
+		}
+		if _, err := env.store.CheckpointEntryResult(env.ctx, batchID, "batch_req_b", testProcessorID, epoch,
+			&api.ResumableResult{Status: api.ResumableEntryCompleted,
+				ResultKey: "results/j1/batch_req_b.jsonl", ResultBytes: 10, ResultSHA256: "sha-b"}); err != nil {
+			t.Fatalf("CheckpointEntryResult: %v", err)
+		}
+		open, err = env.store.HasOpenEntryByRequest(env.ctx, "batch_req_b")
+		if err != nil || open {
+			t.Fatalf("HasOpenEntryByRequest(terminal) = %v (err %v), want false", open, err)
+		}
+	})
+
+	t.Run("orphan requeue backfills the submitter of in-flight entries", func(t *testing.T) {
+		// batch_req_a is in flight; simulate a row written before submitter
+		// tracking by clearing its stamp.
+		if _, err := env.pool.Exec(env.ctx,
+			`UPDATE batch_entries SET submitted_by = NULL WHERE batch_id = $1 AND request_id = $2`,
+			batchID, "batch_req_a"); err != nil {
+			t.Fatalf("clear submitted_by: %v", err)
+		}
+
+		// The batch is requeued as an orphan of its owner.
+		if err := env.store.RequeueResumableOrphan(env.ctx, batchID, testProcessorID, epoch, false, true); err != nil {
+			t.Fatalf("RequeueResumableOrphan: %v", err)
+		}
+
+		entry, err := env.store.FindEntryByRequestID(env.ctx, batchID, "batch_req_a")
+		if err != nil || entry == nil {
+			t.Fatalf("FindEntryByRequestID: entry=%v err=%v", entry, err)
+		}
+		if entry.SubmittedBy != testProcessorID {
+			t.Fatalf("SubmittedBy after requeue = %q, want the orphaned owner %q", entry.SubmittedBy, testProcessorID)
+		}
+	})
+}

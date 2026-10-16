@@ -204,6 +204,19 @@ func (c *PostgresResumableStore) RequeueResumableOrphan(ctx context.Context, bat
 		return nil
 	}
 
+	// The orphaned owner submitted the batch's in-flight requests, so their
+	// unacknowledged result deliveries are stranded on its per-processor
+	// route. Record it as their submitter so the next owner recovers them
+	// from there. Rows written before submitter tracking keep NULL — the
+	// next owner re-submits those directly (the pre-recovery behavior).
+	if _, err := c.pool.Exec(ctx,
+		`UPDATE batch_entries SET submitted_by = $2
+		 WHERE batch_id = $1 AND status = 'in_flight' AND submitted_by IS NULL`,
+		batchID, processorID,
+	); err != nil {
+		return fmt.Errorf("RequeueResumableOrphan: record submitter: %w", err)
+	}
+
 	logr.FromContextOrDiscard(ctx).V(logging.INFO).Info("RequeueResumableOrphan: requeued",
 		"batchId", batchID, "epoch", epoch)
 	return nil
@@ -291,7 +304,7 @@ func jsonEqual(a, b []byte) bool {
 func (c *PostgresResumableStore) MarkEntryInFlight(ctx context.Context, batchID, requestID, processorID string, epoch int64) (bool, error) {
 	result, err := c.pool.Exec(ctx,
 		ownerLockCTE+`UPDATE batch_entries e
-		SET status = 'in_flight', attempts = attempts + 1, updated_at = NOW()
+		SET status = 'in_flight', attempts = attempts + 1, submitted_by = $3, updated_at = NOW()
 		FROM owner
 		WHERE e.batch_id = $1 AND e.request_id = $2
 		  AND e.status IN ('pending','in_flight')`,
@@ -420,21 +433,24 @@ func (c *PostgresResumableStore) EntryResumeState(ctx context.Context, batchID s
 	return state, nil
 }
 
-const entrySelectColumns = `request_id, ordinal, custom_id, status, attempts,
+const entrySelectColumns = `request_id, ordinal, custom_id, status, attempts, submitted_by,
 	result_key, result_bytes, result_sha256, error_code`
 
 // scanEntryRow scans one batch_entries row; scan is rows.Scan or QueryRow.Scan.
 func scanEntryRow(scan func(dest ...any) error, batchID string) (*api.ResumableEntry, error) {
 	var entry api.ResumableEntry
-	var resultKey, resultSHA256, errorCode *string
+	var resultKey, resultSHA256, errorCode, submittedBy *string
 	var resultBytes *int64
 	if err := scan(
-		&entry.RequestID, &entry.Ordinal, &entry.CustomID, &entry.Status, &entry.Attempts,
+		&entry.RequestID, &entry.Ordinal, &entry.CustomID, &entry.Status, &entry.Attempts, &submittedBy,
 		&resultKey, &resultBytes, &resultSHA256, &errorCode,
 	); err != nil {
 		return nil, err
 	}
 	entry.BatchID = batchID
+	if submittedBy != nil {
+		entry.SubmittedBy = *submittedBy
+	}
 	if resultKey != nil {
 		entry.ResultKey = *resultKey
 	}
@@ -497,4 +513,21 @@ func (c *PostgresResumableStore) FindEntryByRequestID(ctx context.Context, batch
 		return nil, fmt.Errorf("FindEntryByRequestID: %w", err)
 	}
 	return entry, nil
+}
+
+// HasOpenEntryByRequest reports whether any batch still awaits the result of
+// the request ID (pending or in_flight entry). Request IDs are stable and
+// batch-scoped, so at most one batch matches; the EXISTS over all batches is
+// conservative if duplicates ever existed.
+func (c *PostgresResumableStore) HasOpenEntryByRequest(ctx context.Context, requestID string) (bool, error) {
+	var open bool
+	if err := c.pool.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM batch_entries
+			WHERE request_id = $1 AND status IN ('pending','in_flight'))`,
+		requestID,
+	).Scan(&open); err != nil {
+		return false, fmt.Errorf("HasOpenEntryByRequest: %w", err)
+	}
+	return open, nil
 }

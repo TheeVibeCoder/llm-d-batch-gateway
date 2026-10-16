@@ -1273,3 +1273,169 @@ func TestBroadcaster_BlockedSendDoesNotStallSubscriptions(t *testing.T) {
 		cancel()
 	})
 }
+
+// TestBroadcaster_ResidueDurableVerification covers the residue gate: an
+// unrouted delivery is acknowledged only when the durable check proves no
+// open entry can still account for it. The regression this pins: an
+// uncheckpointed result arriving before its recovering job has subscribed
+// must not be acknowledged — its lease redelivers it once the owner is
+// reachable, so the completed inference is recovered instead of discarded.
+func TestBroadcaster_ResidueDurableVerification(t *testing.T) {
+	park := func(ctx context.Context) (*inference.GenerateResponse, inference.ResultAck, error) {
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	}
+
+	t.Run("open entry holds the delivery for the recovering owner", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ownerPending := NewPendingRequests(0)
+
+			var delivered atomic.Int32
+			acked := make(chan string, 2)
+			ackFn := func(context.Context) error {
+				acked <- "req-recover"
+				return nil
+			}
+			// The second delivery (the lease redelivery) waits until the
+			// recovering job has subscribed and pre-stored the request.
+			release := make(chan struct{})
+			client := &fakeDurableAsyncClient{
+				receive: func(ctx context.Context) (*inference.GenerateResponse, inference.ResultAck, error) {
+					if ctx.Err() != nil {
+						return nil, nil, ctx.Err()
+					}
+					switch delivered.Add(1) {
+					case 1:
+						return durableResponse("req-recover"), ackFn, nil
+					case 2:
+						select {
+						case <-release:
+							return durableResponse("req-recover"), ackFn, nil
+						case <-ctx.Done():
+							return nil, nil, ctx.Err()
+						}
+					default:
+						return park(ctx)
+					}
+				},
+			}
+
+			broadcaster := NewResultBroadcaster(client, logr.Discard()).
+				WithResidueSafetyCheck(func(context.Context, string) (bool, error) {
+					return false, nil // the entry is still open
+				})
+			ctx, cancel := context.WithCancel(t.Context())
+			go broadcaster.Run(ctx)
+			synctest.Wait()
+
+			// No subscriber yet: the delivery must stay unacked.
+			select {
+			case id := <-acked:
+				t.Fatalf("uncheckpointed result %q was acknowledged before recovery", id)
+			default:
+			}
+
+			// The recovering job subscribes and pre-stores the request; the
+			// lease redelivery routes to it, and only the owner (after its
+			// checkpoint) would release the ack — never the broadcaster.
+			ch := make(chan ResultItem, 2)
+			broadcaster.Subscribe(ch, ownerPending.Has)
+			ownerPending.Store(RequestItem{RequestID: "req-recover", CustomID: "c-recover"})
+			close(release)
+			synctest.Wait()
+
+			select {
+			case result := <-ch:
+				if result.RequestID != "req-recover" {
+					t.Fatalf("owner received %q, want req-recover", result.RequestID)
+				}
+			default:
+				t.Fatal("the redelivery did not reach the recovering owner")
+			}
+			select {
+			case id := <-acked:
+				t.Fatalf("broadcaster released the ack for routed delivery %q", id)
+			default:
+			}
+
+			cancel()
+		})
+	})
+
+	t.Run("terminal entry is acknowledged as residue", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var delivered atomic.Int32
+			acked := make(chan string, 1)
+			client := &fakeDurableAsyncClient{
+				receive: func(ctx context.Context) (*inference.GenerateResponse, inference.ResultAck, error) {
+					if ctx.Err() != nil {
+						return nil, nil, ctx.Err()
+					}
+					if delivered.Add(1) > 1 {
+						return park(ctx)
+					}
+					return durableResponse("req-late"), func(context.Context) error {
+						acked <- "req-late"
+						return nil
+					}, nil
+				},
+			}
+
+			broadcaster := NewResultBroadcaster(client, logr.Discard()).
+				WithResidueSafetyCheck(func(context.Context, string) (bool, error) {
+					return true, nil // no open entry can account for it
+				})
+			ctx, cancel := context.WithCancel(t.Context())
+			go broadcaster.Run(ctx)
+			synctest.Wait()
+
+			select {
+			case id := <-acked:
+				if id != "req-late" {
+					t.Fatalf("acked residue = %q, want req-late", id)
+				}
+			default:
+				t.Fatal("residue with a durably verified terminal entry was not acknowledged")
+			}
+
+			cancel()
+		})
+	})
+
+	t.Run("failed check is not safe", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var delivered atomic.Int32
+			acked := make(chan string, 1)
+			client := &fakeDurableAsyncClient{
+				receive: func(ctx context.Context) (*inference.GenerateResponse, inference.ResultAck, error) {
+					if ctx.Err() != nil {
+						return nil, nil, ctx.Err()
+					}
+					if delivered.Add(1) > 1 {
+						return park(ctx)
+					}
+					return durableResponse("req-unknown"), func(context.Context) error {
+						acked <- "req-unknown"
+						return nil
+					}, nil
+				},
+			}
+
+			broadcaster := NewResultBroadcaster(client, logr.Discard()).
+				WithResidueSafetyCheck(func(context.Context, string) (bool, error) {
+					return false, errors.New("entry store unavailable")
+				})
+			ctx, cancel := context.WithCancel(t.Context())
+			go broadcaster.Run(ctx)
+			synctest.Wait()
+
+			select {
+			case id := <-acked:
+				t.Fatalf("unverifiable delivery %q was acknowledged", id)
+			default:
+			}
+
+			cancel()
+		})
+	})
+}

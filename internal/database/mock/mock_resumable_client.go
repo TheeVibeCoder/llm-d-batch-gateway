@@ -256,6 +256,13 @@ func (m *MockResumableStore) RequeueResumableOrphan(ctx context.Context, batchID
 	if bumpAttempts {
 		b.recoveryAttempts++
 	}
+	// Record the orphaned owner as the submitter of its in-flight entries,
+	// mirroring the Postgres requeue backfill.
+	for _, e := range b.entries {
+		if e.Status == api.ResumableEntryInFlight && e.SubmittedBy == "" {
+			e.SubmittedBy = processorID
+		}
+	}
 	return nil
 }
 
@@ -287,6 +294,7 @@ func (m *MockResumableStore) MarkEntryInFlight(ctx context.Context, batchID, req
 	if e != nil && !e.Status.IsTerminal() && m.ownedFence(b, processorID, epoch) {
 		e.Status = api.ResumableEntryInFlight
 		e.Attempts++
+		e.SubmittedBy = processorID
 		return true, nil
 	}
 	return false, entryNotUpdatable("MarkEntryInFlight", b, e, batchID, requestID, processorID, epoch)
@@ -394,4 +402,18 @@ func (m *MockResumableStore) FindEntryByRequestID(ctx context.Context, batchID, 
 	// a fenced checkpoint may still mutate the stored entry.
 	entry := *e
 	return &entry, nil
+}
+
+func (m *MockResumableStore) HasOpenEntryByRequest(_ context.Context, requestID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, b := range m.batches {
+		for _, e := range b.entries {
+			if e.RequestID == requestID && !e.Status.IsTerminal() {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }

@@ -143,14 +143,39 @@ func (p *Processor) executeJob(ctx context.Context, params *jobExecutionParams) 
 			return ok
 		}
 	}
+	// The dispatcher forwards requests for processing. The pending set exists
+	// before the source: recovering entries are pre-stored into it so their
+	// stranded deliveries route to this job from the start.
+	pending := pipeline.NewPendingRequests(modelMap.LineCount)
+
+	// In-flight entries a previous owner submitted: pre-store them in the
+	// pending set and defer their re-submission for the recovery window, so
+	// their stranded delivery is recovered through the submitter's result
+	// route instead of re-running the inference.
+	recovering, submitters := recoveryPlan(params.resumeSeed, p.processorID, p.asyncInference != nil)
+	if len(recovering) > 0 {
+		sourceCfg.Recover = recovering
+		sourceCfg.RecoveryWindow = p.cfg.Resumable.RecoveryWindow
+		sourceCfg.PreStore = pending.Store
+		sourceCfg.StillPending = pending.Has
+	}
 	source := NewPlanFileSource(sourceCfg)
 
-	// The dispatcher forwards requests for processing.
-	pending := pipeline.NewPendingRequests(modelMap.LineCount)
-	dispatcher, err := p.buildRequestDispatcher(ctx, modelMap, pending, params, logger)
+	// Pre-store the recovering entries before the recovery broadcasters
+	// start claiming the previous submitter's route: a delivery claimed
+	// before its entry is in the pending set routes to no owner and bounces
+	// on its claim lease instead of being checkpointed.
+	if err := source.PreStoreRecovering(); err != nil {
+		return nil, fmt.Errorf("pre-store recovering entries: %w", err)
+	}
+
+	// The dispatcher forwards requests for processing; the release function
+	// drops the job's recovery-broadcaster references after execution.
+	dispatcher, releaseBroadcasters, err := p.buildRequestDispatcher(ctx, modelMap, pending, params, logger, submitters)
 	if err != nil {
 		return nil, fmt.Errorf("build dispatcher: %w", err)
 	}
+	defer releaseBroadcasters()
 
 	// Every result is checkpointed through the sink; finalization streams
 	// the artifacts from the entry set.
@@ -191,16 +216,19 @@ func classifyOutcome(cause error, counts *openai.BatchRequestCounts, execErr err
 	return execErr
 }
 
-func (p *Processor) buildRequestDispatcher(ctx context.Context, modelMap *modelMapFile, pending *pipeline.PendingRequests, params *jobExecutionParams, logger logr.Logger) (pipeline.RequestDispatcher, error) {
+func (p *Processor) buildRequestDispatcher(ctx context.Context, modelMap *modelMapFile, pending *pipeline.PendingRequests, params *jobExecutionParams, logger logr.Logger, submitters []string) (pipeline.RequestDispatcher, func(), error) {
 	// Fence each request into in_flight before dispatch so a zombie
 	// incarnation stops at its next submit instead of streaming the
 	// remaining requests into inference.
 	fence := p.markEntryInFlightHook(ctx, params)
 
 	if p.asyncInference != nil {
-		broadcasters := p.broadcasters.forModels(modelMap)
+		// Besides this processor's own per-model routes, the group consumes
+		// each previous submitter's route so in-flight entries' stranded
+		// deliveries are recovered (refcounted; released after execution).
+		broadcasters, release := p.broadcasters.forModels(modelMap, submitters)
 		async := pipeline.NewAsyncDispatcher(p.asyncInference, broadcasters, pending, logger)
-		return pipeline.NewPreDispatcher(async).WithBeforeSubmit(fence), nil
+		return pipeline.NewPreDispatcher(async).WithBeforeSubmit(fence), release, nil
 	}
 
 	// AIMD is used even when adaptive limits are disabled: with AIMD.Enabled=false,
@@ -211,9 +239,44 @@ func (p *Processor) buildRequestDispatcher(ctx context.Context, modelMap *modelM
 	direct := pipeline.NewDirectDispatcher(p.inference, logger)
 	aimd, err := pipeline.NewAIMDDispatcher(direct, models, p.cfg.Concurrency.Global, logger)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return pipeline.NewPreDispatcher(aimd).WithBeforeSubmit(fence), nil
+	return pipeline.NewPreDispatcher(aimd).WithBeforeSubmit(fence), func() {}, nil
+}
+
+// recoveryPlan splits a resume seed's in-flight entries into the recovering
+// set — request IDs whose re-submission is deferred while their stranded
+// delivery is recovered from the submitter's route — and the distinct
+// previous submitters whose routes the job must consume. Async dispatch
+// only: sync results never travel per-processor routes. Entries submitted
+// by this processor (same-identity restart) defer too, but need no extra
+// broadcaster: their deliveries arrive on the processor's own route.
+// Entries with an unknown submitter (written before submitter tracking)
+// re-submit directly: no route can hold their delivery, so deferral would
+// only add latency. The seed builder enforces the same contract by never
+// mapping an empty submitter; skipping here is defense in depth.
+func recoveryPlan(seed *db.ResumableResumeState, self string, async bool) (map[string]struct{}, []string) {
+	if seed == nil || !async || len(seed.InFlightSubmittedBy) == 0 {
+		return nil, nil
+	}
+	recovering := make(map[string]struct{}, len(seed.InFlightSubmittedBy))
+	seen := make(map[string]struct{})
+	var submitters []string
+	for requestID, submitter := range seed.InFlightSubmittedBy {
+		if submitter == "" {
+			continue // written before submitter tracking: re-submit directly
+		}
+		recovering[requestID] = struct{}{}
+		if submitter == self {
+			continue
+		}
+		if _, dup := seen[submitter]; dup {
+			continue
+		}
+		seen[submitter] = struct{}{}
+		submitters = append(submitters, submitter)
+	}
+	return recovering, submitters
 }
 
 // openInputFile opens the preprocessed input file. Results are checkpointed

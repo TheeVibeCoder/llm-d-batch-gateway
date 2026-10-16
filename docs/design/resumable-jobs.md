@@ -112,14 +112,42 @@ result accounting:
   that redelivery; a duplicate is dropped by the first-wins entry commit.
   Delivery is routed per request — only the job whose pending set owns the
   request receives it — so exactly one consumer can release each
-  acknowledgement, and residue no live job owns is consumed by the
-  broadcaster itself instead of bouncing on its lease.
+  acknowledgement, and residue is acknowledged by the broadcaster only
+  after a durable check (`HasOpenEntryByRequest`) proves no open entry can
+  still account for it: a delivery for a terminal or deleted entry is
+  discarded, while one for an open entry stays unacked so its lease
+  redelivers it to whichever processor recovers its batch.
+- **Stranded deliveries are recovered across processors**: result routes
+  are per-processor (`results/<pool>/<consumer>`), and a request submitted by
+  processor A has its result delivered on A's route even after A dies. The
+  entry therefore records its **submitter** (`batch_entries.submitted_by`,
+  stamped at `MarkEntryInFlight` and backfilled at orphan requeue), and a
+  processor that reclaims a batch consumes each previous submitter's route
+  through a refcounted recovery broadcaster for the batch's models. An
+  in-flight entry is not re-submitted immediately: the resuming owner
+  pre-stores it in its pending set and defers re-submission for a recovery
+  window (`resumable.recovery_window`, default the 5m claim lease), during
+  which the stranded delivery — completed, failed, or deadline-exceeded —
+  is checkpointed through the recovery route; only an entry with no delivery
+  by then falls back to submission. The window ends early once every
+  deferred entry's delivery has been checkpointed (its pending-set entry
+  resolved), so a fully recovered batch does not wait it out. Recovering
+  entries are pre-stored before the recovery broadcasters start claiming
+  (a delivery claimed before its entry is pre-stored routes to no owner and
+  bounces on its lease), and recovery claims hold the route's short lease
+  (60s, not the 5m crash-detection window): two processors recovering
+  different batches from the same dead submitter occasionally claim each
+  other's deliveries, and a mis-claimed foreign delivery — held unacked by
+  the residue gate until its lease lapses — must cost one brief bounce, not
+  a full window. A takeover therefore re-runs inference only for results
+  genuinely lost by the queue, not for results stranded on a dead owner's
+  route.
 - **Duplicate inference** is therefore possible only when a claimed delivery
   is lost outright — a result fetched by a dead or fenced-out owner that was
-  never committed and whose claim lease also lapsed unrecoverably is
-  re-inferred by the new owner; a committed result is not. The worst case is
-  one duplicate dispatch per non-terminal request per takeover, not per
-  retry tick.
+  never committed, stranded on its route, AND not recovered within the
+  recovery window is re-inferred by the new owner; a committed or recovered
+  result is not. The worst case is one duplicate dispatch per non-terminal
+  request per takeover, not per retry tick.
 - A disrupted incarnation's queued submissions are **never cancelled**: the
   queue reports a cancelled request as a `CANCELLED` result, and the next
   incarnation — which re-submits the same stable request IDs — would

@@ -172,7 +172,8 @@ func TestRunJob_Resumable_RequeueClaimResume(t *testing.T) {
 	}, processorID)
 
 	bctx, bcancel := context.WithCancel(context.Background())
-	p.broadcasters = newBroadcasterRegistry(resolver, testLogger(t))
+	residueSafe := residueGate(resumable, residueCheckTimeout)
+	p.broadcasters = newBroadcasterRegistry(resolver, testLogger(t), residueSafe)
 	p.broadcasters.Run(bctx)
 	t.Cleanup(func() {
 		bcancel()
@@ -347,7 +348,8 @@ func TestRunJob_Resumable_FreshActivationKeepsInProgressAt(t *testing.T) {
 	}, processorID)
 
 	bctx, bcancel := context.WithCancel(context.Background())
-	p.broadcasters = newBroadcasterRegistry(resolver, testLogger(t))
+	residueSafe := residueGate(resumable, residueCheckTimeout)
+	p.broadcasters = newBroadcasterRegistry(resolver, testLogger(t), residueSafe)
 	p.broadcasters.Run(bctx)
 	t.Cleanup(func() {
 		bcancel()

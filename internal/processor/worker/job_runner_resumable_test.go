@@ -210,7 +210,7 @@ func setupDurableJob(t *testing.T, jobID string, models []string) *durableJobEnv
 	p.poller = NewPoller(pqClient, dbClient)
 
 	bctx, bcancel := context.WithCancel(context.Background())
-	p.broadcasters = newBroadcasterRegistry(resolver, testLogger(t))
+	p.broadcasters = newBroadcasterRegistry(resolver, testLogger(t), nil)
 	p.broadcasters.Run(bctx)
 	t.Cleanup(func() {
 		bcancel()
